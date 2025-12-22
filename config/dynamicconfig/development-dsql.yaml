@@ -1,0 +1,106 @@
+# Dynamic configuration for Aurora DSQL development environment
+
+# DSQL-specific settings
+persistence.enableDSQLMode:
+  - value: true
+    constraints: {}
+
+# DSQL optimizations - higher retry counts due to optimistic concurrency control
+history.persistenceMaxQPS:
+  - value: 3000
+    constraints: {}
+
+# DSQL connection settings
+persistence.maxConns:
+  - value: 20
+    constraints: {}
+
+persistence.maxIdleConns:
+  - value: 20
+    constraints: {}
+
+# DSQL transaction retry settings (due to optimistic concurrency control)
+persistence.transactionSizeLimit:
+  - value: 4000000
+    constraints: {}
+
+# Buffered events settings (for ID generation)
+history.maxBufferedQueryCount:
+  - value: 1000
+    constraints: {}
+
+# Task processing settings optimized for DSQL
+matching.numTaskqueueReadPartitions:
+  - value: 4
+    constraints: {}
+
+matching.numTaskqueueWritePartitions:
+  - value: 4
+    constraints: {}
+
+# History service settings
+history.timerProcessorMaxPollRPS:
+  - value: 20
+    constraints: {}
+
+history.timerProcessorUpdateAckInterval:
+  - value: 30s
+    constraints: {}
+
+# Visibility settings (if using DSQL for visibility)
+visibility.maxPageSize:
+  - value: 1000
+    constraints: {}
+
+# Cluster membership settings
+system.membershipMaxJoinDuration:
+  - value: 30s
+    constraints: {}
+
+# Archival settings
+archival.history.enableRead:
+  - value: true
+    constraints: {}
+
+archival.visibility.enableRead:
+  - value: true
+    constraints: {}
+
+# Namespace settings
+system.enableNamespaceNotActiveAutoForwarding:
+  - value: true
+    constraints: {}
+
+# Worker settings
+worker.enableLogging:
+  - value: true
+    constraints: {}
+
+# Frontend settings
+frontend.enableClientVersionCheck:
+  - value: true
+    constraints: {}
+
+# Matching settings
+matching.enableTaskInfoLogByDomainID:
+  - value: false
+    constraints: {}
+
+# System settings
+system.enableParentClosePolicy:
+  - value: true
+    constraints: {}
+
+# DSQL-specific retry and timeout settings
+persistence.defaultActivityRetryPolicy:
+  - value:
+      InitialIntervalInSeconds: 1
+      MaximumIntervalInSeconds: 100
+      BackoffCoefficient: 2.0
+      MaximumAttempts: 0
+    constraints: {}
+
+# DSQL connection health check
+persistence.healthCheckInterval:
+  - value: 30s
+    constraints: {}

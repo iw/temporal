@@ -531,6 +531,14 @@ install-schema-postgresql12: temporal-sql-tool
 	./temporal-sql-tool -u $(SQL_USER) --pw $(SQL_PASSWORD) -p 5432 --pl postgres12 --db $(VISIBILITY_DB) setup-schema -v 0.0
 	./temporal-sql-tool -u $(SQL_USER) --pw $(SQL_PASSWORD) -p 5432 --pl postgres12 --db $(VISIBILITY_DB) update-schema -d ./schema/postgresql/v12/visibility/versioned
 
+# Install DSQL schema using PostgreSQL plugin as a surrogate (persistence only, visibility unchanged)
+install-schema-dsql: temporal-sql-tool
+	@printf $(COLOR) "Install DSQL schema (PostgreSQL surrogate)..."
+	./temporal-sql-tool -u $(SQL_USER) --pw $(SQL_PASSWORD) -p 5432 --pl dsql --db $(TEMPORAL_DB) drop -f
+	./temporal-sql-tool -u $(SQL_USER) --pw $(SQL_PASSWORD) -p 5432 --pl dsql --db $(TEMPORAL_DB) create
+	./temporal-sql-tool -u $(SQL_USER) --pw $(SQL_PASSWORD) -p 5432 --pl dsql --db $(TEMPORAL_DB) setup-schema -v 0.0
+	./temporal-sql-tool -u $(SQL_USER) --pw $(SQL_PASSWORD) -p 5432 --pl dsql --db $(TEMPORAL_DB) update-schema -d ./schema/dsql/v12/temporal/versioned
+
 install-schema-es: temporal-elasticsearch-tool
 	@printf $(COLOR) "Install Elasticsearch schema..."
 	./temporal-elasticsearch-tool -ep http://127.0.0.1:9200 setup-schema
