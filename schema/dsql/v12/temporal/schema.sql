@@ -1,6 +1,6 @@
 CREATE TABLE namespaces(
   partition_id INTEGER NOT NULL,
-  id BYTEA NOT NULL,
+  id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR for DSQL compatibility
   name VARCHAR(255) NOT NULL, -- UNIQUE constraint moved to separate index
   notification_version BIGINT NOT NULL,
   --
@@ -11,7 +11,7 @@ CREATE TABLE namespaces(
 );
 
 -- Create unique index separately for better DSQL compatibility
-CREATE UNIQUE INDEX idx_namespaces_name ON namespaces(name);
+CREATE UNIQUE INDEX ASYNC idx_namespaces_name ON namespaces(name);
 
 CREATE TABLE namespace_metadata (
   partition_id INTEGER NOT NULL,
@@ -32,9 +32,9 @@ CREATE TABLE shards (
 
 CREATE TABLE executions(
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
-  run_id BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   --
   next_event_id BIGINT NOT NULL,
   last_write_version BIGINT NOT NULL,
@@ -48,10 +48,10 @@ CREATE TABLE executions(
 
 CREATE TABLE current_executions(
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
   --
-  run_id BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   create_request_id VARCHAR(255) NOT NULL,
   state INTEGER NOT NULL,
   status INTEGER NOT NULL,
@@ -66,9 +66,9 @@ CREATE TABLE current_executions(
 
 CREATE TABLE buffered_events (
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
-  run_id BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   id BIGINT NOT NULL, -- Changed from BIGSERIAL to BIGINT
   --
   data BYTEA NOT NULL,
@@ -77,11 +77,11 @@ CREATE TABLE buffered_events (
 );
 
 -- Create unique index for id field (replaces UNIQUE constraint)
-CREATE UNIQUE INDEX idx_buffered_events_id ON buffered_events(id);
+CREATE UNIQUE INDEX ASYNC idx_buffered_events_id ON buffered_events(id);
 
 CREATE TABLE tasks (
   range_hash BIGINT NOT NULL,
-  task_queue_id BYTEA NOT NULL,
+  task_queue_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   task_id BIGINT NOT NULL,
   --
   data BYTEA NOT NULL,
@@ -92,7 +92,7 @@ CREATE TABLE tasks (
 -- Stores ephemeral task queue information such as ack levels and expiry times
 CREATE TABLE task_queues (
   range_hash BIGINT NOT NULL,
-  task_queue_id BYTEA NOT NULL,
+  task_queue_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   --
   range_id BIGINT NOT NULL,
   data BYTEA NOT NULL,
@@ -104,7 +104,7 @@ CREATE TABLE task_queues (
 -- Used for fairness scheduling. (pass, task_id) are monotonically increasing.
 CREATE TABLE tasks_v2 (
   range_hash BIGINT NOT NULL,
-  task_queue_id BYTEA NOT NULL,
+  task_queue_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   pass BIGINT NOT NULL, -- pass for tasks (see stride scheduling algorithm for fairness)
   task_id BIGINT NOT NULL,
   --
@@ -116,7 +116,7 @@ CREATE TABLE tasks_v2 (
 -- Stores ephemeral task queue information such as ack levels and expiry times
 CREATE TABLE task_queues_v2 (
   range_hash BIGINT NOT NULL,
-  task_queue_id BYTEA NOT NULL,
+  task_queue_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   --
   range_id BIGINT NOT NULL,
   data BYTEA NOT NULL,
@@ -126,7 +126,7 @@ CREATE TABLE task_queues_v2 (
 
 -- Stores task queue information such as user provided versioning data
 CREATE TABLE task_queue_user_data (
-  namespace_id    BYTEA NOT NULL,
+  namespace_id    VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   task_queue_name VARCHAR(255) NOT NULL,
   data            BYTEA NOT NULL,       -- temporal.server.api.persistence.v1.TaskQueueUserData
   data_encoding   VARCHAR(16) NOT NULL, -- Encoding type used for serialization, in practice this should always be proto3
@@ -136,7 +136,7 @@ CREATE TABLE task_queue_user_data (
 
 -- Stores a mapping between build ids and task queues
 CREATE TABLE build_id_to_task_queue (
-  namespace_id    BYTEA NOT NULL,
+  namespace_id    VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   build_id        VARCHAR(255) NOT NULL,
   task_queue_name VARCHAR(255) NOT NULL,
   PRIMARY KEY (namespace_id, build_id, task_queue_name)
@@ -213,9 +213,9 @@ CREATE TABLE visibility_tasks(
 CREATE TABLE activity_info_maps (
 -- each row corresponds to one key of one map<string, ActivityInfo>
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
-  run_id BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   schedule_id BIGINT NOT NULL,
 --
   data BYTEA NOT NULL,
@@ -225,9 +225,9 @@ CREATE TABLE activity_info_maps (
 
 CREATE TABLE timer_info_maps (
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
-  run_id BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   timer_id VARCHAR(255) NOT NULL,
 --
   data BYTEA NOT NULL,
@@ -237,9 +237,9 @@ CREATE TABLE timer_info_maps (
 
 CREATE TABLE child_execution_info_maps (
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
-  run_id BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   initiated_id BIGINT NOT NULL,
 --
   data BYTEA NOT NULL,
@@ -249,9 +249,9 @@ CREATE TABLE child_execution_info_maps (
 
 CREATE TABLE request_cancel_info_maps (
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
-  run_id BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   initiated_id BIGINT NOT NULL,
 --
   data BYTEA NOT NULL,
@@ -261,9 +261,9 @@ CREATE TABLE request_cancel_info_maps (
 
 CREATE TABLE signal_info_maps (
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
-  run_id BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   initiated_id BIGINT NOT NULL,
 --
   data BYTEA NOT NULL,
@@ -273,9 +273,9 @@ CREATE TABLE signal_info_maps (
 
 CREATE TABLE signals_requested_sets (
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
-  run_id BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   signal_id VARCHAR(255) NOT NULL,
   --
   PRIMARY KEY (shard_id, namespace_id, workflow_id, run_id, signal_id)
@@ -283,10 +283,10 @@ CREATE TABLE signals_requested_sets (
 
 CREATE TABLE chasm_node_maps (
   shard_id INTEGER NOT NULL,
-  namespace_id BYTEA NOT NULL,
+  namespace_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   workflow_id VARCHAR(255) NOT NULL,
-  run_id BYTEA NOT NULL,
-  chasm_path BYTEA NOT NULL,
+  run_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
+  chasm_path VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
 --
   metadata BYTEA NOT NULL,
   metadata_encoding VARCHAR(16),
@@ -298,8 +298,8 @@ CREATE TABLE chasm_node_maps (
 -- history eventsV2: history_node stores history event data
 CREATE TABLE history_node (
   shard_id       INTEGER NOT NULL,
-  tree_id        BYTEA NOT NULL,
-  branch_id      BYTEA NOT NULL,
+  tree_id        VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
+  branch_id      VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   node_id        BIGINT NOT NULL,
   txn_id         BIGINT NOT NULL,
   --
@@ -312,8 +312,8 @@ CREATE TABLE history_node (
 -- history eventsV2: history_tree stores branch metadata
 CREATE TABLE history_tree (
   shard_id       INTEGER NOT NULL,
-  tree_id        BYTEA NOT NULL,
-  branch_id      BYTEA NOT NULL,
+  tree_id        VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
+  branch_id      VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
   --
   data           BYTEA NOT NULL,
   data_encoding  VARCHAR(16) NOT NULL,
@@ -349,7 +349,7 @@ CREATE TABLE cluster_metadata_info (
 CREATE TABLE cluster_membership
 (
     membership_partition INTEGER NOT NULL,
-    host_id              BYTEA NOT NULL,
+    host_id              VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
     rpc_address          VARCHAR(128) NOT NULL,
     rpc_port             SMALLINT NOT NULL,
     role                 SMALLINT NOT NULL,
@@ -384,7 +384,7 @@ CREATE TABLE queue_messages (
 
 -- Stores information about Nexus endpoints
 CREATE TABLE nexus_endpoints (
-    id            BYTEA NOT NULL,
+    id            VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
     data          BYTEA NOT NULL,  -- temporal.server.api.persistence.v1.NexusEndpoint
     data_encoding VARCHAR(16) NOT NULL, -- Encoding type used for serialization, in practice this should always be proto3
     version       BIGINT NOT NULL,      -- Version of this row, used for optimistic concurrency
