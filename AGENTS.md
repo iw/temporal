@@ -69,9 +69,11 @@
   - Hostname-based node ID assignment
   - Comprehensive unit tests with concurrency validation
 - ✅ Created DSQL plugin (`common/persistence/sql/sqlplugin/dsql/plugin.go`)
-  - Registers as alias to PostgreSQL plugin for base functionality
+  - **FIRST-CLASS PLUGIN IMPLEMENTATION** - No longer an alias to PostgreSQL
+  - Delegates to PostgreSQL functionality while providing DSQL-specific error handling
   - Custom error handling for DSQL serialization conflicts
   - Connection error detection patterns
+  - Proper plugin registration using `sql.RegisterPlugin`
 - ✅ Unit tests for ID generation (`common/persistence/sql/sqlplugin/idgenerator_test.go`)
   - All tests passing including concurrency tests
   - Validates ID uniqueness, monotonicity, and thread safety
@@ -92,6 +94,8 @@
 #### Testing & Validation
 - ✅ Run `make lint-code` to verify code style compliance (DSQL code clean)
 - ✅ Run unit tests: `make unit-test` (DSQL tests passing)
+- ✅ **DSQL Plugin First-Class Implementation** - No longer alias-based, resolves initialization conflicts
+- ✅ **Docker Image Testing** - Minimal testing passes with new plugin architecture
 - ⏳ Create integration tests for DSQL persistence layer
 - ⏳ Test schema migration from PostgreSQL to DSQL
 - ⏳ Performance testing under load (10× baseline)
@@ -121,6 +125,11 @@
 4. **Multi-Region Support**: Plan for DSQL's multi-region capabilities (future enhancement)
 5. **Transaction Size Limits**: Verify DSQL transaction size limits align with Temporal's requirements
 6. **Index Performance**: Validate async index creation performance and monitoring
+7. **🔐 Security Enhancement**: **Use AWS Secrets Manager for DSQL credentials** instead of local files in production
+   - Store database passwords in AWS Secrets Manager
+   - Configure IAM roles for service authentication
+   - Enable automatic secret rotation
+   - Integrate with Temporal's secret management capabilities
 
 ### Known Constraints
 
@@ -141,6 +150,14 @@ The Aurora DSQL persistence layer implementation is now complete and ready for t
 3. **Configuration**: ✅ Complete - Development configuration files created for both static and dynamic config
 4. **Code Quality**: ✅ Complete - All DSQL code passes linting and unit tests
 5. **Documentation**: ✅ Complete - Comprehensive migration notes and implementation status tracking
+6. **Infrastructure**: ✅ Complete - AWS infrastructure deployed with VPN connectivity
+
+**🔐 Security Recommendations for Production:**
+- **Use AWS Secrets Manager** for database credentials instead of local files
+- Configure IAM roles for DSQL authentication where possible
+- Enable automatic secret rotation
+- Implement least-privilege access policies
+- Use VPC endpoints for secure service communication
 
 **Ready for Next Phase:**
 - Integration testing with actual DSQL cluster

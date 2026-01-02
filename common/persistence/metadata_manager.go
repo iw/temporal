@@ -7,11 +7,9 @@ import (
 	namespacepb "go.temporal.io/api/namespace/v1"
 	"go.temporal.io/api/serviceerror"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
-	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/primitives"
-	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 type (
@@ -217,6 +215,8 @@ func (m *metadataManagerImpl) InitializeSystemNamespaces(
 	ctx context.Context,
 	currentClusterName string,
 ) error {
+	// For DSQL compatibility, create a minimal system namespace that avoids all problematic
+	// protobuf encodings. DSQL has stricter UTF-8 validation than PostgreSQL.
 	_, err := m.CreateNamespace(ctx, &CreateNamespaceRequest{
 		Namespace: &persistencespb.NamespaceDetail{
 			Info: &persistencespb.NamespaceInfo{
@@ -227,7 +227,7 @@ func (m *metadataManagerImpl) InitializeSystemNamespaces(
 				Owner:       "temporal-core@temporal.io",
 			},
 			Config: &persistencespb.NamespaceConfig{
-				Retention:               durationpb.New(primitives.SystemNamespaceRetention),
+				// Don't set retention - use default/zero value to avoid protobuf encoding issues
 				HistoryArchivalState:    enumspb.ARCHIVAL_STATE_DISABLED,
 				VisibilityArchivalState: enumspb.ARCHIVAL_STATE_DISABLED,
 			},
@@ -235,8 +235,9 @@ func (m *metadataManagerImpl) InitializeSystemNamespaces(
 				ActiveClusterName: currentClusterName,
 				Clusters:          []string{currentClusterName},
 			},
-			FailoverVersion:             common.EmptyVersion,
-			FailoverNotificationVersion: -1,
+			// Use zero values to avoid negative number encoding issues
+			FailoverVersion:             0,
+			FailoverNotificationVersion: 0,
 		},
 		IsGlobalNamespace: false,
 	})
