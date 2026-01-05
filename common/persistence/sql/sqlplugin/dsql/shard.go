@@ -3,6 +3,7 @@ package dsql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 )
@@ -49,12 +50,12 @@ func (pdb *db) UpdateShards(
 	// Callers should use UpdateShardsWithFencing instead
 	// For backward compatibility, we'll attempt to detect if this is a fenced update
 	// by checking if the range_id looks like it was incremented from a previous read
-	
+
 	// Use the CAS update pattern to ensure atomicity
 	// Note: This assumes the caller read the current range_id and incremented it
 	// If this assumption is wrong, the update will fail with ConditionFailedError
 	expectedRangeID := row.RangeID - 1
-	
+
 	return pdb.UpdateShardsWithFencing(ctx, row, expectedRangeID)
 }
 
@@ -84,7 +85,7 @@ func (pdb *db) ReadLockShards(
 ) (int64, error) {
 	// DSQL-compatible query without FOR SHARE clause
 	const dsqlReadLockShardQry = `SELECT range_id FROM shards WHERE shard_id = $1`
-	
+
 	// Use retry manager if available (for non-transaction contexts)
 	if pdb.tx == nil && pdb.retryManager != nil {
 		result, err := pdb.retryManager.RunTx(ctx, "ReadLockShards", func(tx *sql.Tx) (interface{}, error) {
@@ -97,7 +98,7 @@ func (pdb *db) ReadLockShards(
 		}
 		return result.(int64), nil
 	}
-	
+
 	// Direct execution for transaction contexts (retry handled at higher level)
 	var rangeID int64
 	err := pdb.GetContext(ctx,
@@ -127,7 +128,7 @@ func (pdb *db) WriteLockShards(
 		}
 		return result.(int64), nil
 	}
-	
+
 	// Direct execution for transaction contexts (retry handled at higher level)
 	var rangeID int64
 	err := pdb.GetContext(ctx,
@@ -168,8 +169,8 @@ func (pdb *db) UpdateShardsWithFencing(
 
 	if rowsAffected == 0 {
 		return nil, NewConditionFailedError(
-			"shard %d range_id changed from expected %d (fenced update failed)",
-			row.ShardID, expectedRangeID,
+			ConditionFailedShard,
+			fmt.Sprintf("shard %d range_id changed from expected %d (fenced update failed)", row.ShardID, expectedRangeID),
 		)
 	}
 

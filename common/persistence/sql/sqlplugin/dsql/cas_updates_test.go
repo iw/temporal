@@ -47,9 +47,9 @@ func TestValidateRowsAffected(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create a mock result
 			result := &mockResult{rowsAffected: tt.rowsAffected}
-			
+
 			err := ValidateRowsAffected(result, tt.entityDesc, tt.fencingToken)
-			
+
 			if tt.expectError {
 				require.Error(t, err)
 				if tt.expectCASError {
@@ -72,7 +72,7 @@ func TestCASUpdateHelpers(t *testing.T) {
 	}{
 		{
 			name:     "condition failed error",
-			err:      NewConditionFailedError("test"),
+			err:      NewConditionFailedError(ConditionFailedUnknown, "test"),
 			expected: true,
 		},
 		{
@@ -117,11 +117,11 @@ func (m *mockResult) RowsAffected() (int64, error) {
 
 func TestGenericCASUpdate_ErrorHandling(t *testing.T) {
 	// Test the error handling logic without requiring a real database connection
-	
+
 	// Test that ValidateRowsAffected works correctly for CAS operations
 	mockResult := &mockResult{rowsAffected: 0}
 	err := ValidateRowsAffected(mockResult, "test_entity", 123)
-	
+
 	// Should get a condition failed error
 	assert.Error(t, err)
 	assert.True(t, IsConditionFailedError(err))

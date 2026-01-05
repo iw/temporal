@@ -45,7 +45,7 @@ func TestClassifyError(t *testing.T) {
 		},
 		{
 			name:     "condition failed error",
-			err:      NewConditionFailedError("test condition failed"),
+			err:      NewConditionFailedError(ConditionFailedUnknown, "test condition failed"),
 			expected: ErrorTypeConditionFailed,
 		},
 		{
@@ -96,7 +96,7 @@ func TestIsRetryableError(t *testing.T) {
 		},
 		{
 			name:     "condition failed error - not retryable",
-			err:      NewConditionFailedError("test condition failed"),
+			err:      NewConditionFailedError(ConditionFailedUnknown, "test condition failed"),
 			expected: false,
 		},
 		{

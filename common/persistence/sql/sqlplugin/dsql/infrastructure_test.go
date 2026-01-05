@@ -11,19 +11,19 @@ import (
 // TestRetryConfig tests the default retry configuration
 func TestRetryConfig(t *testing.T) {
 	config := DefaultRetryConfig()
-	
+
 	if config.MaxRetries != 5 {
 		t.Errorf("Expected MaxRetries to be 5, got %d", config.MaxRetries)
 	}
-	
+
 	if config.BaseDelay != 100*time.Millisecond {
 		t.Errorf("Expected BaseDelay to be 100ms, got %v", config.BaseDelay)
 	}
-	
+
 	if config.MaxDelay != 5*time.Second {
 		t.Errorf("Expected MaxDelay to be 5s, got %v", config.MaxDelay)
 	}
-	
+
 	if config.JitterFactor != 0.25 {
 		t.Errorf("Expected JitterFactor to be 0.25, got %f", config.JitterFactor)
 	}
@@ -32,15 +32,15 @@ func TestRetryConfig(t *testing.T) {
 // TestConditionFailedError tests the ConditionFailedError type
 func TestConditionFailedError(t *testing.T) {
 	err := &ConditionFailedError{Msg: "test condition failed"}
-	
+
 	if err.Error() != "condition failed: test condition failed" {
 		t.Errorf("Expected error message 'condition failed: test condition failed', got '%s'", err.Error())
 	}
-	
+
 	if !IsConditionFailedError(err) {
 		t.Error("Expected IsConditionFailedError to return true for ConditionFailedError")
 	}
-	
+
 	// Test with non-ConditionFailedError
 	otherErr := &testError{msg: "other error"}
 	if IsConditionFailedError(otherErr) {
@@ -60,10 +60,10 @@ func TestErrorTypeString(t *testing.T) {
 		{ErrorTypeUnsupportedFeature, "unsupported_feature"},
 		{ErrorTypeUnknown, "unknown"},
 	}
-	
+
 	for _, test := range tests {
 		if test.errorType.String() != test.expected {
-			t.Errorf("Expected ErrorType %d to have string '%s', got '%s'", 
+			t.Errorf("Expected ErrorType %d to have string '%s', got '%s'",
 				test.errorType, test.expected, test.errorType.String())
 		}
 	}
@@ -73,18 +73,18 @@ func TestErrorTypeString(t *testing.T) {
 func TestDSQLMetricsCreation(t *testing.T) {
 	// Create a no-op metrics handler for testing
 	handler := &noOpMetricsHandler{}
-	
+
 	metrics := NewDSQLMetrics(handler)
 	if metrics == nil {
 		t.Error("Expected NewDSQLMetrics to return non-nil metrics")
 	}
-	
+
 	// Test that nil handler returns no-op implementation
 	nilMetrics := NewDSQLMetrics(nil)
 	if nilMetrics == nil {
 		t.Error("Expected NewDSQLMetrics with nil handler to return non-nil no-op metrics")
 	}
-	
+
 	// Test that no-op metrics don't panic
 	nilMetrics.ObserveTxLatency("test", time.Millisecond)
 	nilMetrics.IncTxErrorClass("test", "retryable")
@@ -96,8 +96,8 @@ func TestDSQLMetricsCreation(t *testing.T) {
 
 // TestNewConditionFailedError tests the NewConditionFailedError function
 func TestNewConditionFailedError(t *testing.T) {
-	err := NewConditionFailedError("test message with %s", "parameter")
-	
+	err := NewConditionFailedError(ConditionFailedUnknown, "test message with parameter")
+
 	expected := "condition failed: test message with parameter"
 	if err.Error() != expected {
 		t.Errorf("Expected error message '%s', got '%s'", expected, err.Error())
@@ -124,9 +124,9 @@ func (h *noOpMetricsHandler) Timer(string) metrics.TimerIface         { return &
 func (h *noOpMetricsHandler) Histogram(string, metrics.MetricUnit) metrics.HistogramIface {
 	return &noOpHistogram{}
 }
-func (h *noOpMetricsHandler) Stop(log.Logger)                      {}
-func (h *noOpMetricsHandler) StartBatch(string) metrics.BatchHandler   { return h }
-func (h *noOpMetricsHandler) Close() error                             { return nil }
+func (h *noOpMetricsHandler) Stop(log.Logger)                        {}
+func (h *noOpMetricsHandler) StartBatch(string) metrics.BatchHandler { return h }
+func (h *noOpMetricsHandler) Close() error                           { return nil }
 
 type noOpCounter struct{}
 

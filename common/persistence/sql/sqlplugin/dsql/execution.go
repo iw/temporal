@@ -174,7 +174,7 @@ func (pdb *db) InsertIntoExecutions(
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
-	
+
 	// Use ExecContext with individual parameters like namespace.go
 	return pdb.ExecContext(ctx,
 		`INSERT INTO executions(shard_id, namespace_id, workflow_id, run_id, next_event_id, last_write_version, data, data_encoding, state, state_encoding, db_record_version)
@@ -202,7 +202,7 @@ func (pdb *db) UpdateExecutions(
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
-	
+
 	return pdb.ExecContext(ctx,
 		`UPDATE executions SET
  db_record_version = $1, next_event_id = $2, last_write_version = $3, data = $4, data_encoding = $5, state = $6, state_encoding = $7
@@ -256,10 +256,10 @@ func (pdb *db) DeleteFromExecutions(
 }
 
 // ReadLockExecutions - DSQL-compatible implementation
-// 
+//
 // ANALYSIS RESULT: ReadLockExecutions is not used anywhere in the Temporal codebase.
 // All execution locking is performed through WriteLockExecutions with proper fencing tokens.
-// 
+//
 // DECISION: Delegate to WriteLockExecutions since DSQL doesn't support FOR SHARE.
 // This maintains interface compatibility while using DSQL-supported locking mechanisms.
 //
@@ -305,7 +305,7 @@ func (pdb *db) InsertIntoCurrentExecutions(
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
-	
+
 	return pdb.ExecContext(ctx,
 		`INSERT INTO current_executions
 (shard_id, namespace_id, workflow_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding) VALUES
@@ -333,7 +333,7 @@ func (pdb *db) UpdateCurrentExecutions(
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
-	
+
 	return pdb.ExecContext(ctx,
 		`UPDATE current_executions SET
 run_id = $1,
@@ -694,7 +694,7 @@ func (pdb *db) InsertIntoBufferedEvents(
 		namespaceIDStr := row.NamespaceID.String()
 		workflowIDStr := row.WorkflowID
 		runIDStr := row.RunID.String()
-		
+
 		_, err := pdb.ExecContext(ctx,
 			`INSERT INTO buffered_events(shard_id, namespace_id, workflow_id, run_id, data, data_encoding)
 VALUES ($1, $2, $3, $4, $5, $6)`,

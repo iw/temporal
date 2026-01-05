@@ -30,7 +30,7 @@ func TestRetryManager_Basic(t *testing.T) {
 	config.BaseDelay = 1 * time.Millisecond // Fast for testing
 
 	rm := NewRetryManager(nil, config, log.NewNoopLogger(), nil)
-	
+
 	// Test that RetryManager is created with correct config
 	assert.Equal(t, 2, rm.config.MaxRetries)
 	assert.Equal(t, 1*time.Millisecond, rm.config.BaseDelay)
@@ -45,7 +45,7 @@ func TestRetryManager_SuccessfulOperation(t *testing.T) {
 	config.BaseDelay = 1 * time.Millisecond
 
 	rm := NewRetryManager(nil, config, log.NewNoopLogger(), nil)
-	
+
 	// Verify the retry manager was created with correct configuration
 	assert.Equal(t, 2, rm.config.MaxRetries)
 	assert.Equal(t, 1*time.Millisecond, rm.config.BaseDelay)
@@ -54,8 +54,8 @@ func TestRetryManager_SuccessfulOperation(t *testing.T) {
 
 func TestRetryManager_ConditionFailedError_NoRetry(t *testing.T) {
 	// Test error classification without database operations
-	err := NewConditionFailedError("test condition failed")
-	
+	err := NewConditionFailedError(ConditionFailedUnknown, "test condition failed")
+
 	// Verify the error is properly classified
 	assert.True(t, IsConditionFailedError(err))
 	assert.Equal(t, ErrorTypeConditionFailed, ClassifyError(err))
@@ -82,7 +82,7 @@ func TestRetryManager_RunTxVoid(t *testing.T) {
 	// Actual database testing would be done in integration tests
 	config := DefaultRetryConfig()
 	rm := NewRetryManager(nil, config, log.NewNoopLogger(), nil)
-	
+
 	// Verify the RunTxVoid method exists and has correct signature
 	assert.NotNil(t, rm.RunTxVoid)
 }
@@ -207,12 +207,12 @@ func TestCalculateBackoff(t *testing.T) {
 		attempt  int
 		expected time.Duration
 	}{
-		{0, 100 * time.Millisecond},  // base delay
-		{1, 200 * time.Millisecond},  // 2^1 * base
-		{2, 400 * time.Millisecond},  // 2^2 * base
-		{3, 800 * time.Millisecond},  // 2^3 * base
-		{4, 1600 * time.Millisecond}, // 2^4 * base
-		{5, 2000 * time.Millisecond}, // capped at max delay
+		{0, 100 * time.Millisecond},   // base delay
+		{1, 200 * time.Millisecond},   // 2^1 * base
+		{2, 400 * time.Millisecond},   // 2^2 * base
+		{3, 800 * time.Millisecond},   // 2^3 * base
+		{4, 1600 * time.Millisecond},  // 2^4 * base
+		{5, 2000 * time.Millisecond},  // capped at max delay
 		{10, 2000 * time.Millisecond}, // still capped at max delay
 	}
 

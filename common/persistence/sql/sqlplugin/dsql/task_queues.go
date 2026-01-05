@@ -3,6 +3,7 @@ package dsql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
@@ -65,12 +66,12 @@ func (pdb *db) UpdateTaskQueues(
 	// Callers should use UpdateTaskQueuesWithFencing instead
 	// For backward compatibility, we'll attempt to detect if this is a fenced update
 	// by checking if the range_id looks like it was incremented from a previous read
-	
+
 	// Use the CAS update pattern to ensure atomicity
 	// Note: This assumes the caller read the current range_id and incremented it
 	// If this assumption is wrong, the update will fail with ConditionFailedError
 	expectedRangeID := row.RangeID - 1
-	
+
 	return pdb.UpdateTaskQueuesWithFencing(ctx, row, expectedRangeID, v)
 }
 
@@ -184,7 +185,7 @@ func (pdb *db) LockTaskQueues(
 		}
 		return result.(int64), nil
 	}
-	
+
 	// Direct execution for transaction contexts (retry handled at higher level)
 	var rangeID int64
 	err := pdb.GetContext(ctx,
@@ -211,10 +212,10 @@ func (pdb *db) LockTaskQueues(
 //   - Other errors for database failures
 //
 // Usage pattern:
-//   1. Read current range_id via LockTaskQueues
-//   2. Modify the task queue data as needed
-//   3. Call UpdateTaskQueuesWithCAS with current range_id as fencing token
-//   4. Handle ConditionFailedError as ownership lost (normal under contention)
+//  1. Read current range_id via LockTaskQueues
+//  2. Modify the task queue data as needed
+//  3. Call UpdateTaskQueuesWithCAS with current range_id as fencing token
+//  4. Handle ConditionFailedError as ownership lost (normal under contention)
 func (pdb *db) UpdateTaskQueuesWithCAS(
 	ctx context.Context,
 	row *sqlplugin.TaskQueuesRow,
@@ -259,8 +260,8 @@ func (pdb *db) UpdateTaskQueuesWithCAS(
 
 	if rowsAffected == 0 {
 		return NewConditionFailedError(
-			"task_queue %s range_id changed from expected %d (CAS update failed)",
-			row.TaskQueueID, expectedRangeID,
+			ConditionFailedTaskQueue,
+			fmt.Sprintf("task_queue %s range_id changed from expected %d (CAS update failed)", string(row.TaskQueueID), expectedRangeID),
 		)
 	}
 
@@ -279,7 +280,7 @@ func (pdb *db) UpdateTaskQueuesWithFencing(
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Return a dummy result since UpdateTaskQueuesWithCAS doesn't return sql.Result
 	// This maintains interface compatibility
 	return &dummyResult{rowsAffected: 1}, nil
@@ -329,8 +330,8 @@ func (pdb *db) UpdateTaskQueueRangeWithCAS(
 
 	if rowsAffected == 0 {
 		return 0, NewConditionFailedError(
-			"task_queue %s range_id changed from expected %d (CAS range increment failed)",
-			taskQueueID, expectedRangeID,
+			ConditionFailedTaskQueue,
+			fmt.Sprintf("task_queue %s range_id changed from expected %d (CAS range increment failed)", taskQueueID, expectedRangeID),
 		)
 	}
 

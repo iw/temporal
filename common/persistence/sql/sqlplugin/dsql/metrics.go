@@ -12,36 +12,36 @@ import (
 type DSQLMetrics interface {
 	// ObserveTxLatency records the total latency of a transaction operation
 	ObserveTxLatency(op string, latency time.Duration)
-	
+
 	// IncTxErrorClass increments the counter for a specific error class
 	IncTxErrorClass(op string, errorClass string)
-	
+
 	// IncTxExhausted increments the counter when retry budget is exhausted
 	IncTxExhausted(op string)
-	
+
 	// IncTxConflict increments the counter for transaction conflicts (SQLSTATE 40001)
 	IncTxConflict(op string)
-	
+
 	// IncTxRetry increments the counter for retry attempts
 	IncTxRetry(op string, attempt int)
-	
+
 	// ObserveTxBackoff records the backoff delay duration
 	ObserveTxBackoff(op string, delay time.Duration)
-	
+
 	// GetHandler returns the underlying metrics handler, or nil if not available
 	GetHandler() metrics.Handler
 }
 
 // dsqlMetricsImpl implements the DSQLMetrics interface using Temporal's metrics system
 type dsqlMetricsImpl struct {
-	handler                   metrics.Handler
-	txLatency                 metrics.TimerIface
-	txErrorClass              metrics.CounterIface
-	txExhausted               metrics.CounterIface
-	txConflict                metrics.CounterIface
-	txRetry                   metrics.CounterIface
-	txBackoff                 metrics.TimerIface
-	
+	handler      metrics.Handler
+	txLatency    metrics.TimerIface
+	txErrorClass metrics.CounterIface
+	txExhausted  metrics.CounterIface
+	txConflict   metrics.CounterIface
+	txRetry      metrics.CounterIface
+	txBackoff    metrics.TimerIface
+
 	// Legacy metrics for backward compatibility
 	retryCounter              metrics.CounterIface
 	conflictCounter           metrics.CounterIface
@@ -59,16 +59,16 @@ func NewDSQLMetrics(metricsHandler metrics.Handler) DSQLMetrics {
 	if metricsHandler == nil {
 		return &noOpDSQLMetrics{}
 	}
-	
+
 	return &dsqlMetricsImpl{
-		handler:                   metricsHandler,
-		txLatency:                 metricsHandler.Timer("dsql_tx_latency"),
-		txErrorClass:              metricsHandler.Counter("dsql_tx_error_class_total"),
-		txExhausted:               metricsHandler.Counter("dsql_tx_exhausted_total"),
-		txConflict:                metricsHandler.Counter("dsql_tx_conflict_total"),
-		txRetry:                   metricsHandler.Counter("dsql_tx_retry_total"),
-		txBackoff:                 metricsHandler.Timer("dsql_tx_backoff"),
-		
+		handler:      metricsHandler,
+		txLatency:    metricsHandler.Timer("dsql_tx_latency"),
+		txErrorClass: metricsHandler.Counter("dsql_tx_error_class_total"),
+		txExhausted:  metricsHandler.Counter("dsql_tx_exhausted_total"),
+		txConflict:   metricsHandler.Counter("dsql_tx_conflict_total"),
+		txRetry:      metricsHandler.Counter("dsql_tx_retry_total"),
+		txBackoff:    metricsHandler.Timer("dsql_tx_backoff"),
+
 		// Legacy metrics for backward compatibility
 		retryCounter:              metricsHandler.Counter("dsql_tx_retries_total"),
 		conflictCounter:           metricsHandler.Counter("dsql_tx_conflicts_total"),
@@ -192,12 +192,12 @@ func (m *dsqlMetricsImpl) RecordUnsupportedFeature(operation, feature string) {
 // noOpDSQLMetrics is a no-op implementation of DSQLMetrics for when metrics are disabled
 type noOpDSQLMetrics struct{}
 
-func (n *noOpDSQLMetrics) ObserveTxLatency(op string, latency time.Duration)    {}
-func (n *noOpDSQLMetrics) IncTxErrorClass(op string, errorClass string)        {}
-func (n *noOpDSQLMetrics) IncTxExhausted(op string)                            {}
-func (n *noOpDSQLMetrics) IncTxConflict(op string)                             {}
-func (n *noOpDSQLMetrics) IncTxRetry(op string, attempt int)                   {}
-func (n *noOpDSQLMetrics) ObserveTxBackoff(op string, delay time.Duration)     {}
+func (n *noOpDSQLMetrics) ObserveTxLatency(op string, latency time.Duration) {}
+func (n *noOpDSQLMetrics) IncTxErrorClass(op string, errorClass string)      {}
+func (n *noOpDSQLMetrics) IncTxExhausted(op string)                          {}
+func (n *noOpDSQLMetrics) IncTxConflict(op string)                           {}
+func (n *noOpDSQLMetrics) IncTxRetry(op string, attempt int)                 {}
+func (n *noOpDSQLMetrics) ObserveTxBackoff(op string, delay time.Duration)   {}
 
 // DSQLOperationMetrics provides operation-specific metrics recording (legacy)
 type DSQLOperationMetrics struct {
@@ -213,7 +213,7 @@ func NewDSQLOperationMetrics(metrics DSQLMetrics, operation string) *DSQLOperati
 		// If metrics is not the expected type, create a dummy one
 		impl = &dsqlMetricsImpl{}
 	}
-	
+
 	return &DSQLOperationMetrics{
 		metrics:   impl,
 		operation: operation,

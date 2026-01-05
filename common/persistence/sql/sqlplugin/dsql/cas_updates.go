@@ -5,10 +5,10 @@
 // for Aurora DSQL's architecture.
 //
 // Key principles:
-//   1) All updates use conditional WHERE clauses with fencing tokens
-//   2) rowsAffected == 0 indicates condition failure (ownership lost)
-//   3) ConditionFailedError is returned for CAS failures (not retried)
-//   4) SQLSTATE 40001 conflicts are handled by retry framework
+//  1. All updates use conditional WHERE clauses with fencing tokens
+//  2. rowsAffected == 0 indicates condition failure (ownership lost)
+//  3. ConditionFailedError is returned for CAS failures (not retried)
+//  4. SQLSTATE 40001 conflicts are handled by retry framework
 package dsql
 
 import (
@@ -33,9 +33,9 @@ import (
 //   - Other errors for database failures
 //
 // Usage pattern:
-//   1. Read current range_id via ReadLockShards
-//   2. Call UpdateShardWithCAS with current range_id as expectedRangeID
-//   3. Handle ConditionFailedError as ownership lost (normal under contention)
+//  1. Read current range_id via ReadLockShards
+//  2. Call UpdateShardWithCAS with current range_id as expectedRangeID
+//  3. Handle ConditionFailedError as ownership lost (normal under contention)
 func (pdb *db) UpdateShardWithCAS(
 	ctx context.Context,
 	shardID int32,
@@ -67,8 +67,8 @@ func (pdb *db) UpdateShardWithCAS(
 
 	if rowsAffected == 0 {
 		return NewConditionFailedError(
-			"shard %d range_id changed from expected %d (CAS update failed)",
-			shardID, expectedRangeID,
+			ConditionFailedShard,
+			fmt.Sprintf("shard %d range_id changed from expected %d (CAS update failed)", shardID, expectedRangeID),
 		)
 	}
 
@@ -114,8 +114,8 @@ func (pdb *db) UpdateShardRangeWithCAS(
 
 	if rowsAffected == 0 {
 		return 0, NewConditionFailedError(
-			"shard %d range_id changed from expected %d (CAS range increment failed)",
-			shardID, expectedRangeID,
+			ConditionFailedShard,
+			fmt.Sprintf("shard %d range_id changed from expected %d (CAS range increment failed)", shardID, expectedRangeID),
 		)
 	}
 
@@ -137,12 +137,13 @@ func (pdb *db) UpdateShardRangeWithCAS(
 //   - Other errors for database failures
 //
 // Example usage:
-//   err := pdb.GenericCASUpdate(ctx,
-//       "UPDATE task_queues_v2 SET range_id = $1 WHERE range_hash = $2 AND task_queue_id = $3 AND range_id = $4",
-//       []interface{}{newRangeID, rangeHash, taskQueueID, expectedRangeID},
-//       fmt.Sprintf("task_queue %s", taskQueueID),
-//       expectedRangeID,
-//   )
+//
+//	err := pdb.GenericCASUpdate(ctx,
+//	    "UPDATE task_queues_v2 SET range_id = $1 WHERE range_hash = $2 AND task_queue_id = $3 AND range_id = $4",
+//	    []interface{}{newRangeID, rangeHash, taskQueueID, expectedRangeID},
+//	    fmt.Sprintf("task_queue %s", taskQueueID),
+//	    expectedRangeID,
+//	)
 func (pdb *db) GenericCASUpdate(
 	ctx context.Context,
 	query string,
@@ -162,8 +163,8 @@ func (pdb *db) GenericCASUpdate(
 
 	if rowsAffected == 0 {
 		return NewConditionFailedError(
-			"%s fencing token changed from expected %v (CAS update failed)",
-			entityDesc, fencingToken,
+			ConditionFailedUnknown,
+			fmt.Sprintf("%s fencing token changed from expected %v (CAS update failed)", entityDesc, fencingToken),
 		)
 	}
 
@@ -191,8 +192,8 @@ func ValidateRowsAffected(result sql.Result, entityDesc string, fencingToken int
 	switch rowsAffected {
 	case 0:
 		return NewConditionFailedError(
-			"%s fencing token changed from expected %v (CAS validation failed)",
-			entityDesc, fencingToken,
+			ConditionFailedUnknown,
+			fmt.Sprintf("%s fencing token changed from expected %v (CAS validation failed)", entityDesc, fencingToken),
 		)
 	case 1:
 		return nil

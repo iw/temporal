@@ -14,6 +14,9 @@ import (
 	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql/driver"
 	"go.temporal.io/server/common/resolver"
 	postgresqlschemaV12 "go.temporal.io/server/schema/postgresql/v12"
+	"errors"
+	"github.com/jackc/pgx/v5/pgconn"
+	persistsql "go.temporal.io/server/common/persistence/sql"
 )
 
 func (pdb *db) IsDupEntryError(err error) bool {
@@ -73,7 +76,7 @@ func newDBWithDependencies(
 		tx:       tx,
 	}
 	mdb.converter = &converter{}
-	
+
 	// Initialize RetryManager if we have logger and metrics
 	// CRITICAL FIX: Remove the tx == nil condition to enable retry for transactions
 	if logger != nil && metricsHandler != nil && handle != nil {
@@ -81,7 +84,7 @@ func newDBWithDependencies(
 			mdb.retryManager = NewRetryManager(db.DB, retryConfig, logger, metricsHandler)
 		}
 	}
-	
+
 	return mdb
 }
 
@@ -92,6 +95,24 @@ func (pdb *db) conn() sqlplugin.Conn {
 	return pdb.handle.Conn()
 }
 
+
+// maybeConvertError preserves raw pg errors for tx-boundary retry classification.
+// Specifically, SQLSTATE 40001 (serialization/OCC conflict) and 0A000 (unsupported feature)
+// must remain visible to the SqlStore tx retry policy.
+// All other errors are converted using the Temporal sql handle.
+func (pdb *db) maybeConvertError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.SQLState() {
+		case "40001", "0A000":
+			return err
+		}
+	}
+	return pdb.handle.ConvertError(err)
+}
 // BeginTx starts a new transaction and returns a reference to the Tx object
 func (pdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
 	db, err := pdb.handle.DB()
@@ -100,22 +121,22 @@ func (pdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
 	}
 	tx, err := db.BeginTxx(ctx, nil)
 	if err != nil {
-		return nil, pdb.handle.ConvertError(err)
+		return nil, pdb.maybeConvertError(err)
 	}
-	
+
 	// Create transaction-level db with retry manager inherited from parent
 	// This ensures that transaction-level operations can use retry logic
 	var logger log.Logger
 	var metricsHandler metrics.Handler
 	retryConfig := DefaultRetryConfig()
-	
+
 	// If parent has retry manager, inherit its configuration
 	if pdb.retryManager != nil {
 		var dsqlMetrics DSQLMetrics
 		logger, dsqlMetrics, retryConfig = pdb.retryManager.GetDependencies()
 		metricsHandler = dsqlMetrics.GetHandler()
 	}
-	
+
 	return newDBWithDependencies(pdb.dbKind, pdb.dbName, pdb.dbDriver, pdb.handle, tx, logger, metricsHandler, retryConfig), nil
 }
 
@@ -166,12 +187,12 @@ func (pdb *db) Rollback() error {
 // Helper methods to hide common error handling
 func (pdb *db) ExecContext(ctx context.Context, stmt string, args ...any) (sql.Result, error) {
 	res, err := pdb.conn().ExecContext(ctx, stmt, args...)
-	return res, pdb.handle.ConvertError(err)
+	return res, pdb.maybeConvertError(err)
 }
 
 func (pdb *db) GetContext(ctx context.Context, dest any, query string, args ...any) error {
 	err := pdb.conn().GetContext(ctx, dest, query, args...)
-	return pdb.handle.ConvertError(err)
+	return pdb.maybeConvertError(err)
 }
 
 func (pdb *db) Select(dest any, query string, args ...any) error {
@@ -180,22 +201,22 @@ func (pdb *db) Select(dest any, query string, args ...any) error {
 		return err
 	}
 	err = db.Select(dest, query, args...)
-	return pdb.handle.ConvertError(err)
+	return pdb.maybeConvertError(err)
 }
 
 func (pdb *db) SelectContext(ctx context.Context, dest any, query string, args ...any) error {
 	err := pdb.conn().SelectContext(ctx, dest, query, args...)
-	return pdb.handle.ConvertError(err)
+	return pdb.maybeConvertError(err)
 }
 
 func (pdb *db) NamedExecContext(ctx context.Context, query string, arg any) (sql.Result, error) {
 	res, err := pdb.conn().NamedExecContext(ctx, query, arg)
-	return res, pdb.handle.ConvertError(err)
+	return res, pdb.maybeConvertError(err)
 }
 
 func (pdb *db) PrepareNamedContext(ctx context.Context, query string) (*sqlx.NamedStmt, error) {
 	stmt, err := pdb.conn().PrepareNamedContext(ctx, query)
-	return stmt, pdb.handle.ConvertError(err)
+	return stmt, pdb.maybeConvertError(err)
 }
 
 func (pdb *db) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
@@ -204,7 +225,7 @@ func (pdb *db) QueryContext(ctx context.Context, query string, args ...any) (*sq
 		return nil, err
 	}
 	rows, err := db.QueryContext(ctx, query, args...)
-	return rows, pdb.handle.ConvertError(err)
+	return rows, pdb.maybeConvertError(err)
 }
 
 func (pdb *db) Rebind(query string) string {
@@ -214,4 +235,15 @@ func (pdb *db) Rebind(query string) string {
 // GetRetryManager returns the retry manager for DSQL operations
 func (pdb *db) GetRetryManager() *RetryManager {
 	return pdb.retryManager
+}
+
+
+// TxRetryPolicy exposes a tx-boundary retry policy to the SqlStore.
+// This enables retry of entire persistence transactions on SQLSTATE 40001 for Aurora DSQL,
+// while leaving other SQL plugins unchanged.
+func (pdb *db) TxRetryPolicy() persistsql.TxRetryPolicy {
+	if pdb.retryManager == nil {
+		return nil
+	}
+	return NewDSQLTxRetryPolicy(pdb.retryManager)
 }
