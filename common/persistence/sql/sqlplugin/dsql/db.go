@@ -7,6 +7,8 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	"go.temporal.io/server/common/config"
+	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence/schema"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql/driver"
@@ -28,10 +30,11 @@ type db struct {
 	dbName   string
 	dbDriver driver.Driver
 
-	plugin    *plugin
-	cfg       *config.SQL
-	resolver  resolver.ServiceResolver
-	converter DataConverter
+	plugin       *plugin
+	cfg          *config.SQL
+	resolver     resolver.ServiceResolver
+	converter    DataConverter
+	retryManager *RetryManager
 
 	handle *sqlplugin.DatabaseHandle
 	tx     *sqlx.Tx
@@ -48,6 +51,20 @@ func newDB(
 	handle *sqlplugin.DatabaseHandle,
 	tx *sqlx.Tx,
 ) *db {
+	return newDBWithDependencies(dbKind, dbName, dbDriver, handle, tx, nil, nil, DefaultRetryConfig())
+}
+
+// newDBWithDependencies returns an instance of DB with full dependency injection
+func newDBWithDependencies(
+	dbKind sqlplugin.DbKind,
+	dbName string,
+	dbDriver driver.Driver,
+	handle *sqlplugin.DatabaseHandle,
+	tx *sqlx.Tx,
+	logger log.Logger,
+	metricsHandler metrics.Handler,
+	retryConfig RetryConfig,
+) *db {
 	mdb := &db{
 		dbKind:   dbKind,
 		dbName:   dbName,
@@ -56,6 +73,15 @@ func newDB(
 		tx:       tx,
 	}
 	mdb.converter = &converter{}
+	
+	// Initialize RetryManager if we have logger and metrics
+	// CRITICAL FIX: Remove the tx == nil condition to enable retry for transactions
+	if logger != nil && metricsHandler != nil && handle != nil {
+		if db, err := handle.DB(); err == nil {
+			mdb.retryManager = NewRetryManager(db.DB, retryConfig, logger, metricsHandler)
+		}
+	}
+	
 	return mdb
 }
 
@@ -70,14 +96,27 @@ func (pdb *db) conn() sqlplugin.Conn {
 func (pdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
 	db, err := pdb.handle.DB()
 	if err != nil {
-		// This error needs no conversion
 		return nil, err
 	}
 	tx, err := db.BeginTxx(ctx, nil)
 	if err != nil {
 		return nil, pdb.handle.ConvertError(err)
 	}
-	return newDB(pdb.dbKind, pdb.dbName, pdb.dbDriver, pdb.handle, tx), nil
+	
+	// Create transaction-level db with retry manager inherited from parent
+	// This ensures that transaction-level operations can use retry logic
+	var logger log.Logger
+	var metricsHandler metrics.Handler
+	retryConfig := DefaultRetryConfig()
+	
+	// If parent has retry manager, inherit its configuration
+	if pdb.retryManager != nil {
+		var dsqlMetrics DSQLMetrics
+		logger, dsqlMetrics, retryConfig = pdb.retryManager.GetDependencies()
+		metricsHandler = dsqlMetrics.GetHandler()
+	}
+	
+	return newDBWithDependencies(pdb.dbKind, pdb.dbName, pdb.dbDriver, pdb.handle, tx, logger, metricsHandler, retryConfig), nil
 }
 
 // Close closes the connection to the dsql db
@@ -170,4 +209,9 @@ func (pdb *db) QueryContext(ctx context.Context, query string, args ...any) (*sq
 
 func (pdb *db) Rebind(query string) string {
 	return pdb.conn().Rebind(query)
+}
+
+// GetRetryManager returns the retry manager for DSQL operations
+func (pdb *db) GetRetryManager() *RetryManager {
+	return pdb.retryManager
 }

@@ -11,6 +11,8 @@ require (
 	cloud.google.com/go/storage v1.51.0
 	github.com/Masterminds/sprig/v3 v3.3.0
 	github.com/aws/aws-sdk-go v1.55.8
+	github.com/aws/aws-sdk-go-v2/config v1.32.6
+	github.com/aws/aws-sdk-go-v2/feature/dsql/auth v1.1.16
 	github.com/blang/semver/v4 v4.0.0
 	github.com/cactus/go-statsd-client/v5 v5.1.0
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da
@@ -79,9 +81,7 @@ require (
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.0 // indirect
-	github.com/aws/aws-sdk-go-v2/config v1.32.6 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.6 // indirect
-	github.com/aws/aws-sdk-go-v2/feature/dsql/auth v1.1.16 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.16 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.16 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.16 // indirect
