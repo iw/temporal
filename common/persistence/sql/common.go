@@ -14,19 +14,38 @@ import (
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
+	"time"
 )
+
+type TxRetryPolicy interface {
+	MaxRetries() int
+	Backoff(attempt int) time.Duration
+	RetryableTxError(err error) bool
+}
+
+type TxRetryPolicyProvider interface {
+	TxRetryPolicy() TxRetryPolicy
+}
 
 // TODO: Rename all SQL Managers to Stores
 type SqlStore struct {
 	DB     sqlplugin.DB
 	logger log.Logger
+
+	// txRetryPolicy is optional. When nil, txExecute behavior is unchanged.
+	// DSQL plugin provides a policy to enable tx-boundary retry on SQLSTATE 40001.
+	txRetryPolicy TxRetryPolicy
 }
 
 func NewSqlStore(db sqlplugin.DB, logger log.Logger) SqlStore {
-	return SqlStore{
+	store := SqlStore{
 		DB:     db,
 		logger: logger,
 	}
+	if p, ok := db.(TxRetryPolicyProvider); ok {
+		store.txRetryPolicy = p.TxRetryPolicy()
+	}
+	return store
 }
 
 func (m *SqlStore) GetName() string {
@@ -46,7 +65,7 @@ func (m *SqlStore) Close() {
 	}
 }
 
-func (m *SqlStore) txExecute(ctx context.Context, operation string, f func(tx sqlplugin.Tx) error) error {
+func (m *SqlStore) txExecuteOnce(ctx context.Context, operation string, f func(tx sqlplugin.Tx) error) error {
 	tx, err := m.DB.BeginTx(ctx)
 	if err != nil {
 		return serviceerror.NewUnavailablef("%s failed. Failed to start transaction. Error: %v", operation, err)
@@ -75,6 +94,41 @@ func (m *SqlStore) txExecute(ctx context.Context, operation string, f func(tx sq
 		return serviceerror.NewUnavailablef("%s operation failed. Failed to commit transaction. Error: %v", operation, err)
 	}
 	return nil
+}
+
+func (m *SqlStore) txExecute(ctx context.Context, operation string, f func(tx sqlplugin.Tx) error) error {
+	// Default behavior for existing SQL plugins (Postgres/MySQL/etc.) remains unchanged.
+	if m.txRetryPolicy == nil {
+		return m.txExecuteOnce(ctx, operation, f)
+	}
+
+	maxRetries := m.txRetryPolicy.MaxRetries()
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		err := m.txExecuteOnce(ctx, operation, f)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		// Do not retry context cancellation.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+
+		// Only retry when policy says it's retryable.
+		if !m.txRetryPolicy.RetryableTxError(err) || attempt == maxRetries {
+			return err
+		}
+
+		delay := m.txRetryPolicy.Backoff(attempt)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return lastErr
 }
 
 func gobSerialize(x interface{}) ([]byte, error) {

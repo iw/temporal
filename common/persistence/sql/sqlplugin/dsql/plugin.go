@@ -46,6 +46,7 @@ var defaultDatabaseNames = []string{
 type plugin struct {
 	driver         driver.Driver
 	queryConverter sqlplugin.VisibilityQueryConverter
+	retryConfig    RetryConfig
 }
 
 var _ sqlplugin.Plugin = (*plugin)(nil)
@@ -54,6 +55,7 @@ func init() {
 	sql.RegisterPlugin(PluginName, &plugin{
 		driver:         &driver.PGXDriver{},
 		queryConverter: &queryConverter{},
+		retryConfig:    DefaultRetryConfig(),
 	})
 }
 
@@ -77,7 +79,7 @@ func (p *plugin) CreateDB(
 	}
 	needsRefresh := p.driver.IsConnNeedsRefreshError
 	handle := sqlplugin.NewDatabaseHandle(dbKind, connect, needsRefresh, logger, metricsHandler, clock.NewRealTimeSource())
-	db := newDB(dbKind, cfg.DatabaseName, p.driver, handle, nil)
+	db := newDBWithDependencies(dbKind, cfg.DatabaseName, p.driver, handle, nil, logger, metricsHandler, p.retryConfig)
 	return db, nil
 }
 

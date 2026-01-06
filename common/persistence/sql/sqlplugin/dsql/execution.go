@@ -27,7 +27,8 @@ const (
  WHERE shard_id = $1 AND namespace_id = $2 AND workflow_id = $3 AND run_id = $4`
 
 	writeLockExecutionQuery = lockExecutionQueryBase + ` FOR UPDATE`
-	readLockExecutionQuery  = lockExecutionQueryBase + ` FOR SHARE`
+	// NOTE: readLockExecutionQuery removed - read-lock clause is not supported by DSQL
+	// Use ReadLockExecutions method which delegates to WriteLockExecutions for DSQL compatibility
 
 	createCurrentExecutionQuery = `INSERT INTO current_executions
 (shard_id, namespace_id, workflow_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding) VALUES
@@ -173,7 +174,7 @@ func (pdb *db) InsertIntoExecutions(
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
-	
+
 	// Use ExecContext with individual parameters like namespace.go
 	return pdb.ExecContext(ctx,
 		`INSERT INTO executions(shard_id, namespace_id, workflow_id, run_id, next_event_id, last_write_version, data, data_encoding, state, state_encoding, db_record_version)
@@ -201,7 +202,7 @@ func (pdb *db) UpdateExecutions(
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
-	
+
 	return pdb.ExecContext(ctx,
 		`UPDATE executions SET
  db_record_version = $1, next_event_id = $2, last_write_version = $3, data = $4, data_encoding = $5, state = $6, state_encoding = $7
@@ -254,21 +255,28 @@ func (pdb *db) DeleteFromExecutions(
 	)
 }
 
-// ReadLockExecutions acquires a write lock on a single row in executions table
+// ReadLockExecutions - DSQL-compatible implementation
+//
+// ANALYSIS RESULT: ReadLockExecutions is not used anywhere in the Temporal codebase.
+// All execution locking is performed through WriteLockExecutions with proper fencing tokens.
+//
+// DECISION: Delegate to WriteLockExecutions since DSQL doesn't support read-lock clause.
+// This maintains interface compatibility while using DSQL-supported locking mechanisms.
+//
+// SAFETY: This is safe because:
+// 1. Method is unused in current codebase (zero call sites found)
+// 2. WriteLockExecutions provides stronger guarantees than read-lock clause
+// 3. All actual execution locking uses WriteLockExecutions with proper fencing
+//
+// Requirements: 6.1, 6.2 - Replace unsupported read-lock clause with DSQL-compatible patterns
 func (pdb *db) ReadLockExecutions(
 	ctx context.Context,
 	filter sqlplugin.ExecutionsFilter,
 ) (int64, int64, error) {
-	var executionVersion sqlplugin.ExecutionVersion
-	err := pdb.GetContext(ctx,
-		&executionVersion,
-		readLockExecutionQuery,
-		filter.ShardID,
-		filter.NamespaceID.String(),
-		filter.WorkflowID,
-		filter.RunID.String(),
-	)
-	return executionVersion.DBRecordVersion, executionVersion.NextEventID, err
+	// DSQL doesn't support read-lock clause, delegate to WriteLockExecutions
+	// This is safe since the method is unused in the codebase and WriteLockExecutions
+	// provides stronger consistency guarantees than read-lock clause would
+	return pdb.WriteLockExecutions(ctx, filter)
 }
 
 // WriteLockExecutions acquires a write lock on a single row in executions table
@@ -297,7 +305,7 @@ func (pdb *db) InsertIntoCurrentExecutions(
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
-	
+
 	return pdb.ExecContext(ctx,
 		`INSERT INTO current_executions
 (shard_id, namespace_id, workflow_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding) VALUES
@@ -325,7 +333,7 @@ func (pdb *db) UpdateCurrentExecutions(
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
-	
+
 	return pdb.ExecContext(ctx,
 		`UPDATE current_executions SET
 run_id = $1,
@@ -686,7 +694,7 @@ func (pdb *db) InsertIntoBufferedEvents(
 		namespaceIDStr := row.NamespaceID.String()
 		workflowIDStr := row.WorkflowID
 		runIDStr := row.RunID.String()
-		
+
 		_, err := pdb.ExecContext(ctx,
 			`INSERT INTO buffered_events(shard_id, namespace_id, workflow_id, run_id, data, data_encoding)
 VALUES ($1, $2, $3, $4, $5, $6)`,
