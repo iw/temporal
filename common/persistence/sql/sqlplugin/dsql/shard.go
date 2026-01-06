@@ -23,7 +23,7 @@ const (
  WHERE shard_id = $4`
 
 	lockShardQry = `SELECT range_id FROM shards WHERE shard_id = $1 FOR UPDATE`
-	// NOTE: readLockShardQry removed - FOR SHARE is not supported by DSQL
+	// NOTE: readLockShardQry removed - read-lock clause is not supported by DSQL
 	// Use ReadLockShards method which implements DSQL-compatible optimistic reads
 )
 
@@ -107,13 +107,13 @@ func (pdb *db) SelectFromShards(
 }
 
 // ReadLockShards acquires a read lock on a single row in shards table
-// DSQL Override: Removes FOR SHARE clause and uses optimistic reads.
+// DSQL Override: Removes read-lock clause clause and uses optimistic reads.
 // Call-site contract: Used only for range_id validation, no subsequent writes in same transaction.
 func (pdb *db) ReadLockShards(
 	ctx context.Context,
 	filter sqlplugin.ShardsFilter,
 ) (int64, error) {
-	// DSQL-compatible query without FOR SHARE clause.
+	// DSQL-compatible query without read-lock clause clause.
 	const dsqlReadLockShardQry = `SELECT range_id FROM shards WHERE shard_id = $1`
 
 	// Use retry manager if available (for non-transaction contexts).

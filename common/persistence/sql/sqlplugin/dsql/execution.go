@@ -27,7 +27,7 @@ const (
  WHERE shard_id = $1 AND namespace_id = $2 AND workflow_id = $3 AND run_id = $4`
 
 	writeLockExecutionQuery = lockExecutionQueryBase + ` FOR UPDATE`
-	// NOTE: readLockExecutionQuery removed - FOR SHARE is not supported by DSQL
+	// NOTE: readLockExecutionQuery removed - read-lock clause is not supported by DSQL
 	// Use ReadLockExecutions method which delegates to WriteLockExecutions for DSQL compatibility
 
 	createCurrentExecutionQuery = `INSERT INTO current_executions
@@ -260,22 +260,22 @@ func (pdb *db) DeleteFromExecutions(
 // ANALYSIS RESULT: ReadLockExecutions is not used anywhere in the Temporal codebase.
 // All execution locking is performed through WriteLockExecutions with proper fencing tokens.
 //
-// DECISION: Delegate to WriteLockExecutions since DSQL doesn't support FOR SHARE.
+// DECISION: Delegate to WriteLockExecutions since DSQL doesn't support read-lock clause.
 // This maintains interface compatibility while using DSQL-supported locking mechanisms.
 //
 // SAFETY: This is safe because:
 // 1. Method is unused in current codebase (zero call sites found)
-// 2. WriteLockExecutions provides stronger guarantees than FOR SHARE
+// 2. WriteLockExecutions provides stronger guarantees than read-lock clause
 // 3. All actual execution locking uses WriteLockExecutions with proper fencing
 //
-// Requirements: 6.1, 6.2 - Replace unsupported FOR SHARE with DSQL-compatible patterns
+// Requirements: 6.1, 6.2 - Replace unsupported read-lock clause with DSQL-compatible patterns
 func (pdb *db) ReadLockExecutions(
 	ctx context.Context,
 	filter sqlplugin.ExecutionsFilter,
 ) (int64, int64, error) {
-	// DSQL doesn't support FOR SHARE, delegate to WriteLockExecutions
+	// DSQL doesn't support read-lock clause, delegate to WriteLockExecutions
 	// This is safe since the method is unused in the codebase and WriteLockExecutions
-	// provides stronger consistency guarantees than FOR SHARE would
+	// provides stronger consistency guarantees than read-lock clause would
 	return pdb.WriteLockExecutions(ctx, filter)
 }
 
