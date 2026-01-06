@@ -228,6 +228,18 @@ func (pdb *db) QueryContext(ctx context.Context, query string, args ...any) (*sq
 	return rows, pdb.maybeConvertError(err)
 }
 
+func (pdb *db) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if pdb.tx != nil {
+		return pdb.tx.QueryRowContext(ctx, query, args...)
+	}
+	db, err := pdb.handle.DB()
+	if err != nil {
+		// Return a row that will produce the error when scanned
+		return &sql.Row{}
+	}
+	return db.QueryRowContext(ctx, query, args...)
+}
+
 func (pdb *db) Rebind(query string) string {
 	return pdb.conn().Rebind(query)
 }

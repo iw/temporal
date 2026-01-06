@@ -233,12 +233,30 @@ func (pdb *db) UpdateNamespaceMetadata(
 	ctx context.Context,
 	row *sqlplugin.NamespaceMetadataRow,
 ) (sql.Result, error) {
-	return pdb.ExecContext(ctx,
+	// This is a fenced update: notification_version acts as the fencing token.
+	// On DSQL, ensure we convert a 0-row update into a ConditionFailedError.
+	result, err := pdb.ExecContext(ctx,
 		updateNamespaceMetadataQuery,
 		row.NotificationVersion+1,
 		row.NotificationVersion,
 		partitionID,
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if rowsAffected == 0 {
+		return nil, NewConditionFailedError(
+			ConditionFailedNamespace,
+			fmt.Sprintf("namespace_metadata notification_version changed ... expected %d (CAS update failed)", row.NotificationVersion),
+		)
+	}
+
+	return result, nil
 }
 
 // UpdateNamespaceMetadataWithCAS performs a conditional update on namespace_metadata table
