@@ -1,6 +1,7 @@
 package dsql
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
@@ -90,9 +91,13 @@ func (pdb *db) WriteSchemaUpdateLog(oldVersion string, newVersion string, manife
 
 // ListTables returns a list of tables in this database
 func (pdb *db) ListTables(database string) ([]string, error) {
-	var tables []string
-	err := pdb.Select(&tables, listTablesQuery)
-	return tables, pdb.handle.ConvertError(err)
+    ctx := context.Background()
+
+    var tables []string
+    if err := pdb.SelectContext(ctx, &tables, listTablesQuery); err != nil {
+        return nil, err
+    }
+    return tables, nil
 }
 
 // DropTable drops a given table from the database

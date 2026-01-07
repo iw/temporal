@@ -50,9 +50,19 @@ func (pdb *db) InsertIntoTaskQueues(
 	row *sqlplugin.TaskQueuesRow,
 	v sqlplugin.MatchingTaskVersion,
 ) (sql.Result, error) {
+	// DSQL keying: task_queues_v2.task_queue_id is stored as UUID (DB column type UUID).
+	// Bind as a string UUID, not []byte (which would be treated as BYTEA).
+	args := map[string]interface{}{
+		"range_hash":    row.RangeHash,
+		"task_queue_id": TaskQueueIDToUUIDString(row.TaskQueueID),
+		"range_id":      row.RangeID,
+		"data":          row.Data,
+		"data_encoding": row.DataEncoding,
+	}
+
 	return pdb.NamedExecContext(ctx,
 		sqlplugin.SwitchTaskQueuesTable(createTaskQueueQry, v),
-		row,
+		args,
 	)
 }
 
@@ -80,6 +90,8 @@ func (pdb *db) UpdateTaskQueuesAutoFenced(
 	row *sqlplugin.TaskQueuesRow,
 	v sqlplugin.MatchingTaskVersion,
 ) (sql.Result, error) {
+	taskQueueID := TaskQueueIDToUUIDString(row.TaskQueueID)
+
 	var currentRangeID int64
 	var err error
 
@@ -88,9 +100,9 @@ func (pdb *db) UpdateTaskQueuesAutoFenced(
 	// We intentionally use lockTaskQueueQry (FOR UPDATE). In DSQL this does not block, but it is
 	// a supported primitive and matches the intention of reading a stable fencing token.
 	if pdb.tx != nil {
-		err = pdb.tx.QueryRowContext(ctx, lockQry, row.RangeHash, row.TaskQueueID).Scan(&currentRangeID)
+		err = pdb.tx.QueryRowContext(ctx, lockQry, row.RangeHash, taskQueueID).Scan(&currentRangeID)
 	} else {
-		err = pdb.QueryRowContext(ctx, lockQry, row.RangeHash, row.TaskQueueID).Scan(&currentRangeID)
+		err = pdb.QueryRowContext(ctx, lockQry, row.RangeHash, taskQueueID).Scan(&currentRangeID)
 	}
 	if err != nil {
 		return nil, err
@@ -100,7 +112,7 @@ func (pdb *db) UpdateTaskQueuesAutoFenced(
 	if row.RangeID <= currentRangeID {
 		return nil, NewConditionFailedError(
 			ConditionFailedTaskQueue,
-			fmt.Sprintf("task queue %s range_id not increasing (current=%d new=%d)", row.TaskQueueID, currentRangeID, row.RangeID),
+			fmt.Sprintf("task queue %s range_id not increasing (current=%d new=%d)", taskQueueID, currentRangeID, row.RangeID),
 		)
 	}
 
@@ -139,11 +151,12 @@ func (pdb *db) selectFromTaskQueues(
 ) ([]sqlplugin.TaskQueuesRow, error) {
 	var err error
 	var row sqlplugin.TaskQueuesRow
+
 	err = pdb.GetContext(ctx,
 		&row,
 		sqlplugin.SwitchTaskQueuesTable(getTaskQueueQry, v),
 		filter.RangeHash,
-		filter.TaskQueueID,
+		TaskQueueIDToUUIDString(filter.TaskQueueID),
 	)
 	if err != nil {
 		return nil, err
@@ -158,13 +171,19 @@ func (pdb *db) rangeSelectFromTaskQueues(
 ) ([]sqlplugin.TaskQueuesRow, error) {
 	var err error
 	var rows []sqlplugin.TaskQueuesRow
+
+	gt := ""
+	if filter.TaskQueueIDGreaterThan != nil {
+		gt = TaskQueueIDToUUIDString(filter.TaskQueueIDGreaterThan)
+	}
+
 	if filter.RangeHashLessThanEqualTo > 0 {
 		err = pdb.SelectContext(ctx,
 			&rows,
 			sqlplugin.SwitchTaskQueuesTable(listTaskQueueWithHashRangeQry, v),
 			filter.RangeHashGreaterThanEqualTo,
 			filter.RangeHashLessThanEqualTo,
-			filter.TaskQueueIDGreaterThan,
+			gt,
 			*filter.PageSize,
 		)
 	} else {
@@ -172,7 +191,7 @@ func (pdb *db) rangeSelectFromTaskQueues(
 			&rows,
 			sqlplugin.SwitchTaskQueuesTable(listTaskQueueQry, v),
 			filter.RangeHash,
-			filter.TaskQueueIDGreaterThan,
+			gt,
 			*filter.PageSize,
 		)
 	}
@@ -192,7 +211,7 @@ func (pdb *db) DeleteFromTaskQueues(
 	return pdb.ExecContext(ctx,
 		sqlplugin.SwitchTaskQueuesTable(deleteTaskQueueQry, v),
 		filter.RangeHash,
-		filter.TaskQueueID,
+		TaskQueueIDToUUIDString(filter.TaskQueueID),
 		*filter.RangeID,
 	)
 }
@@ -205,12 +224,14 @@ func (pdb *db) LockTaskQueues(
 	filter sqlplugin.TaskQueuesFilter,
 	v sqlplugin.MatchingTaskVersion,
 ) (int64, error) {
+	taskQueueID := TaskQueueIDToUUIDString(filter.TaskQueueID)
+
 	// Use retry manager if available (for non-transaction contexts)
 	if pdb.tx == nil && pdb.retryManager != nil {
 		result, err := pdb.retryManager.RunTx(ctx, "LockTaskQueues", func(tx *sql.Tx) (interface{}, error) {
 			var rangeID int64
 			query := sqlplugin.SwitchTaskQueuesTable(lockTaskQueueQry, v)
-			err := tx.QueryRowContext(ctx, query, filter.RangeHash, filter.TaskQueueID).Scan(&rangeID)
+			err := tx.QueryRowContext(ctx, query, filter.RangeHash, taskQueueID).Scan(&rangeID)
 			return rangeID, err
 		})
 		if err != nil {
@@ -225,7 +246,7 @@ func (pdb *db) LockTaskQueues(
 		&rangeID,
 		sqlplugin.SwitchTaskQueuesTable(lockTaskQueueQry, v),
 		filter.RangeHash,
-		filter.TaskQueueID,
+		taskQueueID,
 	)
 	return rangeID, err
 }
@@ -247,9 +268,11 @@ func (pdb *db) UpdateTaskQueuesWithCAS(
 		task_queue_id = :task_queue_id AND
 		range_id = :expected_range_id`
 
+	taskQueueID := TaskQueueIDToUUIDString(row.TaskQueueID)
+
 	args := map[string]interface{}{
 		"range_hash":        row.RangeHash,
-		"task_queue_id":     row.TaskQueueID,
+		"task_queue_id":     taskQueueID,
 		"range_id":          row.RangeID,
 		"data":              row.Data,
 		"data_encoding":     row.DataEncoding,
@@ -272,7 +295,7 @@ func (pdb *db) UpdateTaskQueuesWithCAS(
 	if rowsAffected == 0 {
 		return NewConditionFailedError(
 			ConditionFailedTaskQueue,
-			fmt.Sprintf("task_queue %s range_id changed from expected %d (CAS update failed)", row.TaskQueueID, expectedRangeID),
+			fmt.Sprintf("task_queue %s range_id changed from expected %d (CAS update failed)", taskQueueID, expectedRangeID),
 		)
 	}
 

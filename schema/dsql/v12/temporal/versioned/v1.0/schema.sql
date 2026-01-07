@@ -81,7 +81,7 @@ CREATE UNIQUE INDEX ASYNC idx_buffered_events_id ON buffered_events(id);
 
 CREATE TABLE tasks (
   range_hash BIGINT NOT NULL,
-  task_queue_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
+  task_queue_id UUID NOT NULL, -- Changed from BYTEA to UUID
   task_id BIGINT NOT NULL,
   --
   data BYTEA NOT NULL,
@@ -92,7 +92,7 @@ CREATE TABLE tasks (
 -- Stores ephemeral task queue information such as ack levels and expiry times
 CREATE TABLE task_queues (
   range_hash BIGINT NOT NULL,
-  task_queue_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
+  task_queue_id UUID NOT NULL, -- Changed from BYTEA to UUID
   --
   range_id BIGINT NOT NULL,
   data BYTEA NOT NULL,
@@ -104,7 +104,7 @@ CREATE TABLE task_queues (
 -- Used for fairness scheduling. (pass, task_id) are monotonically increasing.
 CREATE TABLE tasks_v2 (
   range_hash BIGINT NOT NULL,
-  task_queue_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
+  task_queue_id UUID NOT NULL, -- Changed from BYTEA to UUID
   pass BIGINT NOT NULL, -- pass for tasks (see stride scheduling algorithm for fairness)
   task_id BIGINT NOT NULL,
   --
@@ -116,7 +116,7 @@ CREATE TABLE tasks_v2 (
 -- Stores ephemeral task queue information such as ack levels and expiry times
 CREATE TABLE task_queues_v2 (
   range_hash BIGINT NOT NULL,
-  task_queue_id VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
+  task_queue_id UUID NOT NULL, -- Changed from BYTEA to UUID
   --
   range_id BIGINT NOT NULL,
   data BYTEA NOT NULL,
