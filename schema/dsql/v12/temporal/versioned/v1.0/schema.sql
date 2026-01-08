@@ -298,8 +298,8 @@ CREATE TABLE chasm_node_maps (
 -- history eventsV2: history_node stores history event data
 CREATE TABLE history_node (
   shard_id       INTEGER NOT NULL,
-  tree_id        VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
-  branch_id      VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
+  tree_id        UUID NOT NULL, -- Changed from BYTEA to UUID
+  branch_id      UUID NOT NULL, -- Changed from BYTEA to UUID
   node_id        BIGINT NOT NULL,
   txn_id         BIGINT NOT NULL,
   --
@@ -312,8 +312,8 @@ CREATE TABLE history_node (
 -- history eventsV2: history_tree stores branch metadata
 CREATE TABLE history_tree (
   shard_id       INTEGER NOT NULL,
-  tree_id        VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
-  branch_id      VARCHAR(255) NOT NULL, -- Changed from BYTEA to VARCHAR
+  tree_id        UUID NOT NULL, -- Changed from BYTEA to UUID
+  branch_id      UUID NOT NULL, -- Changed from BYTEA to UUID
   --
   data           BYTEA NOT NULL,
   data_encoding  VARCHAR(16) NOT NULL,
