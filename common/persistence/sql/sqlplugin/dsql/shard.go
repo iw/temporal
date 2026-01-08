@@ -41,51 +41,47 @@ func (pdb *db) InsertIntoShards(
 	)
 }
 
-// UpdateShards updates one or more rows into shards table
-// DSQL Override: Replace unsafe unfenced UPDATE with an auto-fenced CAS update.
-// This preserves the sqlplugin interface while preventing lost updates under DSQL OCC.
+// UpdateShards updates one or more rows into shards table.
 //
-// The auto-fenced update reads the current range_id and attempts a conditional update
-// against that value. It does NOT assume "newRangeID-1".
+// DSQL behavior:
+// - In transaction contexts (pdb.tx != nil), this method must preserve upstream semantics:
+//   the caller has already acquired the shard row via FOR UPDATE and relies on the
+//   transaction as the fence. We therefore perform the unfenced UPDATE.
+// - Outside a transaction (pdb.tx == nil), we perform an auto-fenced conditional update
+//   using the currently observed range_id as the expected fencing token.
 func (pdb *db) UpdateShards(
 	ctx context.Context,
 	row *sqlplugin.ShardsRow,
 ) (sql.Result, error) {
+	// In a transaction, preserve upstream behavior (lock + tx acts as the fence).
+	if pdb.tx != nil {
+		return pdb.ExecContext(ctx,
+			updateShardQry,
+			row.RangeID,
+			row.Data,
+			row.DataEncoding,
+			row.ShardID,
+		)
+	}
+
+	// Outside a transaction, do a safe fenced update.
 	return pdb.UpdateShardsAutoFenced(ctx, row)
 }
 
-// UpdateShardsAutoFenced performs a conditional update without relying on any inferred
-// expected range_id (e.g. "newRangeID-1").
-//
-// It reads the current range_id and attempts to update only if the row is unchanged.
-// If the new range_id is not greater than the current range_id, it returns ConditionFailedError.
+// UpdateShardsAutoFenced performs a fenced update for non-transaction contexts.
+// It reads the current range_id and then updates only if that range_id is unchanged.
+// This does not impose monotonicity rules; it only enforces "no lost update".
 func (pdb *db) UpdateShardsAutoFenced(
 	ctx context.Context,
 	row *sqlplugin.ShardsRow,
 ) (sql.Result, error) {
 	var currentRangeID int64
-	var err error
-
-	// We intentionally use lockShardQry (FOR UPDATE). In DSQL this does not block, but it is
-	// a supported primitive and matches the intention of reading a stable fencing token.
-	if pdb.tx != nil {
-		err = pdb.tx.QueryRowContext(ctx, lockShardQry, row.ShardID).Scan(&currentRangeID)
-	} else {
-		err = pdb.QueryRowContext(ctx, lockShardQry, row.ShardID).Scan(&currentRangeID)
-	}
-	if err != nil {
+	if err := pdb.GetContext(ctx, &currentRangeID, `SELECT range_id FROM shards WHERE shard_id = $1`, row.ShardID); err != nil {
 		return nil, err
 	}
 
-	// Enforce monotonicity: range_id must increase.
-	if row.RangeID <= currentRangeID {
-		return nil, NewConditionFailedError(
-			ConditionFailedShard,
-			fmt.Sprintf("shard %d range_id not increasing (current=%d new=%d)", row.ShardID, currentRangeID, row.RangeID),
-		)
-	}
-
-	// Attempt fenced update against the observed current value.
+	// Fenced update: allow any range_id the caller provides (equal, +1, etc.),
+	// but only if the row hasn't changed since we read it.
 	return pdb.UpdateShardsWithFencing(ctx, row, currentRangeID)
 }
 
@@ -107,13 +103,13 @@ func (pdb *db) SelectFromShards(
 }
 
 // ReadLockShards acquires a read lock on a single row in shards table
-// DSQL Override: Removes read-lock clause clause and uses optimistic reads.
+// DSQL Override: Removes read-lock clause and uses optimistic reads.
 // Call-site contract: Used only for range_id validation, no subsequent writes in same transaction.
 func (pdb *db) ReadLockShards(
 	ctx context.Context,
 	filter sqlplugin.ShardsFilter,
 ) (int64, error) {
-	// DSQL-compatible query without read-lock clause clause.
+	// DSQL-compatible query without read-lock clause.
 	const dsqlReadLockShardQry = `SELECT range_id FROM shards WHERE shard_id = $1`
 
 	// Use retry manager if available (for non-transaction contexts).
@@ -179,6 +175,9 @@ func (pdb *db) UpdateShardsWithFencing(
 	const updateShardWithFencingQry = `UPDATE shards 
 		SET range_id = $1, data = $2, data_encoding = $3 
 		WHERE shard_id = $4 AND range_id = $5`
+
+	fmt.Printf("[DSQL-DEBUG] UpdateShardsWithFencing: shard_id=%d, expected_range_id=%d, new_range_id=%d\n",
+		int(row.ShardID), expectedRangeID, row.RangeID)
 
 	result, err := pdb.ExecContext(ctx,
 		updateShardWithFencingQry,

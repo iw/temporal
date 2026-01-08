@@ -195,15 +195,6 @@ func (pdb *db) GetContext(ctx context.Context, dest any, query string, args ...a
 	return pdb.maybeConvertError(err)
 }
 
-func (pdb *db) Select(dest any, query string, args ...any) error {
-	db, err := pdb.handle.DB()
-	if err != nil {
-		return err
-	}
-	err = db.Select(dest, query, args...)
-	return pdb.maybeConvertError(err)
-}
-
 func (pdb *db) SelectContext(ctx context.Context, dest any, query string, args ...any) error {
 	err := pdb.conn().SelectContext(ctx, dest, query, args...)
 	return pdb.maybeConvertError(err)

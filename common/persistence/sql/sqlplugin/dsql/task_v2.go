@@ -28,18 +28,38 @@ const (
 		`ORDER BY task_queue_id,pass,task_id LIMIT $5 )`
 )
 
-// InsertIntoTasks inserts one or more rows into tasks table
+type tasksV2InsertRow struct {
+	RangeHash    uint32 `db:"range_hash"`
+	TaskQueueID  string `db:"task_queue_id"`
+	TaskID       int64  `db:"task_id"`
+	TaskPass     int64  `db:"task_pass"`
+	Data         []byte `db:"data"`
+	DataEncoding string `db:"data_encoding"`
+}
+
+// InsertIntoTasks inserts one or more rows into tasks_v2 table.
 func (pdb *db) InsertIntoTasksV2(
 	ctx context.Context,
 	rows []sqlplugin.TasksRowV2,
 ) (sql.Result, error) {
-	return pdb.NamedExecContext(ctx,
-		createTaskV2Qry,
-		rows,
-	)
+	// DSQL keying: tasks_v2.task_queue_id is stored as UUID (DB column type UUID).
+	// We must bind it as a string UUID (or uuid.UUID), not []byte (which would be treated as BYTEA).
+	insertRows := make([]tasksV2InsertRow, 0, len(rows))
+	for _, r := range rows {
+		insertRows = append(insertRows, tasksV2InsertRow{
+			RangeHash:    r.RangeHash,
+			TaskQueueID:  TaskQueueIDToUUIDString(r.TaskQueueID),
+			TaskID:       r.TaskID,
+			TaskPass:     r.TaskPass,
+			Data:         r.Data,
+			DataEncoding: r.DataEncoding,
+		})
+	}
+
+	return pdb.NamedExecContext(ctx, createTaskV2Qry, insertRows)
 }
 
-// SelectFromTasks reads one or more rows from tasks table
+// SelectFromTasks reads one or more rows from tasks_v2 table.
 func (pdb *db) SelectFromTasksV2(
 	ctx context.Context,
 	filter sqlplugin.TasksFilterV2,
@@ -47,6 +67,9 @@ func (pdb *db) SelectFromTasksV2(
 	if filter.InclusiveMinLevel == nil {
 		return nil, serviceerror.NewInternal("missing InclusiveMinLevel")
 	}
+
+	taskQueueID := TaskQueueIDToUUIDString(filter.TaskQueueID)
+
 	var err error
 	var rows []sqlplugin.TasksRowV2
 	switch {
@@ -55,7 +78,7 @@ func (pdb *db) SelectFromTasksV2(
 			&rows,
 			getTaskV2QryWithLimit,
 			filter.RangeHash,
-			filter.TaskQueueID,
+			taskQueueID,
 			filter.InclusiveMinLevel.TaskPass,
 			filter.InclusiveMinLevel.TaskID,
 			*filter.PageSize,
@@ -65,7 +88,7 @@ func (pdb *db) SelectFromTasksV2(
 			&rows,
 			getTaskV2Qry,
 			filter.RangeHash,
-			filter.TaskQueueID,
+			taskQueueID,
 			filter.InclusiveMinLevel.TaskPass,
 			filter.InclusiveMinLevel.TaskID,
 		)
@@ -73,7 +96,7 @@ func (pdb *db) SelectFromTasksV2(
 	return rows, err
 }
 
-// DeleteFromTasks deletes multiple rows from tasks table
+// DeleteFromTasks deletes multiple rows from tasks_v2 table.
 func (pdb *db) DeleteFromTasksV2(
 	ctx context.Context,
 	filter sqlplugin.TasksFilterV2,
@@ -84,10 +107,13 @@ func (pdb *db) DeleteFromTasksV2(
 	if filter.Limit == nil || *filter.Limit == 0 {
 		return nil, serviceerror.NewInternal("missing limit parameter")
 	}
+
+	taskQueueID := TaskQueueIDToUUIDString(filter.TaskQueueID)
+
 	return pdb.ExecContext(ctx,
 		rangeDeleteTaskV2Qry,
 		filter.RangeHash,
-		filter.TaskQueueID,
+		taskQueueID,
 		filter.ExclusiveMaxLevel.TaskPass,
 		filter.ExclusiveMaxLevel.TaskID,
 		*filter.Limit,
