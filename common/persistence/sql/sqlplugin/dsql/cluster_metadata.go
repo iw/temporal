@@ -3,7 +3,6 @@ package dsql
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -158,9 +157,9 @@ func (pdb *db) UpsertClusterMembership(
 	ctx context.Context,
 	row *sqlplugin.ClusterMembershipRow,
 ) (sql.Result, error) {
-	// Convert HostID to hex string for DSQL VARCHAR compatibility
-	hostIDStr := fmt.Sprintf("%x", row.HostID)
-	
+	// Convert HostID to UUID string for DSQL UUID column compatibility
+	hostIDStr := BytesToUUIDString(row.HostID)
+
 	return pdb.ExecContext(ctx,
 		templateUpsertActiveClusterMembership,
 		constMembershipPartition,
@@ -185,8 +184,8 @@ func (pdb *db) GetClusterMembers(
 
 	if filter.HostIDEquals != nil {
 		queryString.WriteString(templateWithHostIDSuffix)
-		// Convert HostID to hex string for DSQL VARCHAR compatibility
-		hostIDStr := fmt.Sprintf("%x", filter.HostIDEquals)
+		// Convert HostID to UUID string for DSQL UUID column compatibility
+		hostIDStr := BytesToUUIDString(filter.HostIDEquals)
 		operands = append(operands, hostIDStr)
 		queryString.WriteString(strconv.Itoa(len(operands)))
 	}
@@ -223,8 +222,8 @@ func (pdb *db) GetClusterMembers(
 
 	if filter.HostIDGreaterThan != nil {
 		queryString.WriteString(templateWithHostIDGreaterSuffix)
-		// Convert HostID to hex string for DSQL VARCHAR compatibility
-		hostIDStr := fmt.Sprintf("%x", filter.HostIDGreaterThan)
+		// Convert HostID to UUID string for DSQL UUID column compatibility
+		hostIDStr := BytesToUUIDString(filter.HostIDGreaterThan)
 		operands = append(operands, hostIDStr)
 		queryString.WriteString(strconv.Itoa(len(operands)))
 	}

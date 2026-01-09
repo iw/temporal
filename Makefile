@@ -3,7 +3,7 @@
 install: bins
 
 # Rebuild binaries (used by Dockerfile).
-bins: temporal-server temporal-cassandra-tool temporal-sql-tool temporal-elasticsearch-tool tdbg
+bins: temporal-server temporal-cassandra-tool temporal-sql-tool temporal-elasticsearch-tool temporal-dsql-tool tdbg
 
 # Install all tools, recompile proto files, run all possible checks and tests (long but comprehensive).
 all: clean proto bins check test
@@ -341,6 +341,7 @@ clean-bins:
 	@rm -f tdbg
 	@rm -f temporal-sql-tool
 	@rm -f temporal-elasticsearch-tool
+	@rm -f temporal-dsql-tool
 
 temporal-server: $(ALL_SRC)
 	@printf $(COLOR) "Build temporal-server with CGO_ENABLED=$(CGO_ENABLED) for $(GOOS)/$(GOARCH)..."
@@ -357,6 +358,10 @@ temporal-cassandra-tool: $(ALL_SRC)
 temporal-sql-tool: $(ALL_SRC)
 	@printf $(COLOR) "Build temporal-sql-tool with CGO_ENABLED=$(CGO_ENABLED) for $(GOOS)/$(GOARCH)..."
 	CGO_ENABLED=$(CGO_ENABLED) go build $(BUILD_TAG_FLAG) -o temporal-sql-tool ./cmd/tools/sql
+
+temporal-dsql-tool: $(ALL_SRC)
+	@printf $(COLOR) "Build temporal-dsql-tool with CGO_ENABLED=$(CGO_ENABLED) for $(GOOS)/$(GOARCH)..."
+	CGO_ENABLED=$(CGO_ENABLED) go build $(BUILD_TAG_FLAG) -o temporal-dsql-tool ./cmd/tools/dsql
 
 temporal-elasticsearch-tool: $(ALL_SRC)
 	@printf $(COLOR) "Build temporal-elasticsearch-tool with CGO_ENABLED=$(CGO_ENABLED) for $(GOOS)/$(GOARCH)..."

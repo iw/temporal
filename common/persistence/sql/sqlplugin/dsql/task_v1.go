@@ -3,7 +3,6 @@ package dsql
 import (
 	"context"
 	"database/sql"
-	"fmt"
 
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
@@ -34,23 +33,30 @@ func (pdb *db) InsertIntoTasks(
 	ctx context.Context,
 	rows []sqlplugin.TasksRow,
 ) (sql.Result, error) {
-	// For DSQL, we need to convert UUID fields to strings
-	for _, row := range rows {
-		taskQueueIDStr := fmt.Sprintf("%x-%x-%x-%x-%x", row.TaskQueueID[0:4], row.TaskQueueID[4:6], row.TaskQueueID[6:8], row.TaskQueueID[8:10], row.TaskQueueID[10:16])
-		
-		_, err := pdb.ExecContext(ctx,
-			`INSERT INTO tasks(range_hash, task_queue_id, task_id, data, data_encoding) VALUES($1, $2, $3, $4, $5)`,
-			row.RangeHash,
-			taskQueueIDStr,
-			row.TaskID,
-			row.Data,
-			row.DataEncoding,
-		)
-		if err != nil {
-			return nil, err
-		}
+	// DSQL keying: tasks.task_queue_id is stored as UUID (or UUID-compatible text).
+	// sqlplugin.TasksRow.TaskQueueID is []byte (original taskQueueId), so we must not
+	// mutate it to []byte(uuidString) (that would bind as BYTEA). Instead, build a
+	// slice of insert rows where task_queue_id is a string.
+	type insertRow struct {
+		RangeHash    uint32 `db:"range_hash"`
+		TaskQueueID  string `db:"task_queue_id"`
+		TaskID       int64  `db:"task_id"`
+		Data         []byte `db:"data"`
+		DataEncoding string `db:"data_encoding"`
 	}
-	return nil, nil
+
+	insertRows := make([]insertRow, 0, len(rows))
+	for _, r := range rows {
+		insertRows = append(insertRows, insertRow{
+			RangeHash:    r.RangeHash,
+			TaskQueueID:  TaskQueueIDToUUIDString(r.TaskQueueID),
+			TaskID:       r.TaskID,
+			Data:         r.Data,
+			DataEncoding: r.DataEncoding,
+		})
+	}
+
+	return pdb.NamedExecContext(ctx, createTaskQry, insertRows)
 }
 
 // SelectFromTasks reads one or more rows from tasks table
@@ -60,15 +66,16 @@ func (pdb *db) SelectFromTasks(
 ) ([]sqlplugin.TasksRow, error) {
 	var err error
 	var rows []sqlplugin.TasksRow
-	taskQueueIDStr := fmt.Sprintf("%x-%x-%x-%x-%x", filter.TaskQueueID[0:4], filter.TaskQueueID[4:6], filter.TaskQueueID[6:8], filter.TaskQueueID[8:10], filter.TaskQueueID[10:16])
-	
+
+	taskQueueID := TaskQueueIDToUUIDString(filter.TaskQueueID)
+
 	switch {
 	case filter.ExclusiveMaxTaskID != nil:
 		err = pdb.SelectContext(ctx,
 			&rows,
 			getTaskMinMaxQry,
 			filter.RangeHash,
-			taskQueueIDStr,
+			taskQueueID,
 			*filter.InclusiveMinTaskID,
 			*filter.ExclusiveMaxTaskID,
 			*filter.PageSize,
@@ -78,7 +85,7 @@ func (pdb *db) SelectFromTasks(
 			&rows,
 			getTaskMinQry,
 			filter.RangeHash,
-			taskQueueIDStr,
+			taskQueueID,
 			*filter.InclusiveMinTaskID,
 			*filter.PageSize,
 		)
@@ -97,11 +104,13 @@ func (pdb *db) DeleteFromTasks(
 	if filter.Limit == nil || *filter.Limit == 0 {
 		return nil, serviceerror.NewInternal("missing limit parameter")
 	}
-	taskQueueIDStr := fmt.Sprintf("%x-%x-%x-%x-%x", filter.TaskQueueID[0:4], filter.TaskQueueID[4:6], filter.TaskQueueID[6:8], filter.TaskQueueID[8:10], filter.TaskQueueID[10:16])
+
+	taskQueueID := TaskQueueIDToUUIDString(filter.TaskQueueID)
+
 	return pdb.ExecContext(ctx,
 		rangeDeleteTaskQry,
 		filter.RangeHash,
-		taskQueueIDStr,
+		taskQueueID,
 		*filter.ExclusiveMaxTaskID,
 		*filter.Limit,
 	)

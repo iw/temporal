@@ -3,7 +3,6 @@ package dsql
 import (
 	"context"
 	"database/sql"
-	"fmt"
 
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 )
@@ -58,34 +57,20 @@ func (pdb *db) InsertIntoHistoryNode(
 	row *sqlplugin.HistoryNodeRow,
 ) (sql.Result, error) {
 	// NOTE: txn_id is *= -1 within DB
-	row.TxnID = -row.TxnID
-	
-	// DSQL-specific: Convert UUID bytes to strings for VARCHAR fields
-	originalTreeID := row.TreeID
-	originalBranchID := row.BranchID
-	
-	// Convert UUID bytes to string representation for DSQL
-	if len(row.TreeID) == 16 {
-		// This is a UUID in byte format, convert to string
-		treeIDStr := fmt.Sprintf("%x-%x-%x-%x-%x", 
-			row.TreeID[0:4], row.TreeID[4:6], row.TreeID[6:8], row.TreeID[8:10], row.TreeID[10:16])
-		row.TreeID = []byte(treeIDStr)
+	txnID := -row.TxnID
+
+	args := map[string]interface{}{
+		"shard_id":      row.ShardID,
+		"tree_id":       UUIDToString(row.TreeID),
+		"branch_id":     UUIDToString(row.BranchID),
+		"node_id":       row.NodeID,
+		"prev_txn_id":   row.PrevTxnID,
+		"txn_id":        txnID,
+		"data":          row.Data,
+		"data_encoding": row.DataEncoding,
 	}
-	if len(row.BranchID) == 16 {
-		// This is a UUID in byte format, convert to string
-		branchIDStr := fmt.Sprintf("%x-%x-%x-%x-%x", 
-			row.BranchID[0:4], row.BranchID[4:6], row.BranchID[6:8], row.BranchID[8:10], row.BranchID[10:16])
-		row.BranchID = []byte(branchIDStr)
-	}
-	
-	result, err := pdb.NamedExecContext(ctx, addHistoryNodesQuery, row)
-	
-	// Restore original values to avoid side effects
-	row.TreeID = originalTreeID
-	row.BranchID = originalBranchID
-	row.TxnID = -row.TxnID // Restore original txn_id
-	
-	return result, err
+
+	return pdb.NamedExecContext(ctx, addHistoryNodesQuery, args)
 }
 
 // DeleteFromHistoryNode delete a row from history_node table
@@ -94,18 +79,19 @@ func (pdb *db) DeleteFromHistoryNode(
 	row *sqlplugin.HistoryNodeRow,
 ) (sql.Result, error) {
 	// NOTE: txn_id is *= -1 within DB
-	row.TxnID = -row.TxnID
+	txnID := -row.TxnID
+
 	return pdb.ExecContext(ctx,
 		deleteHistoryNodeQuery,
 		row.ShardID,
-		row.TreeID,
-		row.BranchID,
+		UUIDToString(row.TreeID),
+		UUIDToString(row.BranchID),
 		row.NodeID,
-		row.TxnID,
+		txnID,
 	)
 }
 
-// SelectFromHistoryNode reads one or more rows from history_node table
+// RangeSelectFromHistoryNode reads one or more rows from history_node table
 func (pdb *db) RangeSelectFromHistoryNode(
 	ctx context.Context,
 	filter sqlplugin.HistoryNodeSelectFilter,
@@ -119,12 +105,15 @@ func (pdb *db) RangeSelectFromHistoryNode(
 		query = getHistoryNodesQuery
 	}
 
+	treeID := UUIDToString(filter.TreeID)
+	branchID := UUIDToString(filter.BranchID)
+
 	var args []interface{}
 	if filter.ReverseOrder {
 		args = []interface{}{
 			filter.ShardID,
-			filter.TreeID,
-			filter.BranchID,
+			treeID,
+			branchID,
 			filter.MinNodeID,
 			filter.MaxTxnID,
 			-filter.MaxTxnID,
@@ -134,8 +123,8 @@ func (pdb *db) RangeSelectFromHistoryNode(
 	} else {
 		args = []interface{}{
 			filter.ShardID,
-			filter.TreeID,
-			filter.BranchID,
+			treeID,
+			branchID,
 			filter.MinNodeID,
 			-filter.MinTxnID, // NOTE: transaction ID is *= -1 when stored
 			filter.MinNodeID,
@@ -149,14 +138,16 @@ func (pdb *db) RangeSelectFromHistoryNode(
 	if err != nil {
 		return nil, err
 	}
-	// NOTE: since we let txn_id multiple by -1 when inserting, we have to revert it back here
-	for index := range rows {
-		rows[index].TxnID = -rows[index].TxnID
+
+	// NOTE: since we store txn_id multiplied by -1 when inserting, revert it back here
+	for i := range rows {
+		rows[i].TxnID = -rows[i].TxnID
 	}
+
 	return rows, nil
 }
 
-// DeleteFromHistoryNode deletes one or more rows from history_node table
+// RangeDeleteFromHistoryNode deletes one or more rows from history_node table
 func (pdb *db) RangeDeleteFromHistoryNode(
 	ctx context.Context,
 	filter sqlplugin.HistoryNodeDeleteFilter,
@@ -164,8 +155,8 @@ func (pdb *db) RangeDeleteFromHistoryNode(
 	return pdb.ExecContext(ctx,
 		deleteHistoryNodesQuery,
 		filter.ShardID,
-		filter.TreeID,
-		filter.BranchID,
+		UUIDToString(filter.TreeID),
+		UUIDToString(filter.BranchID),
 		filter.MinNodeID,
 	)
 }
@@ -177,31 +168,15 @@ func (pdb *db) InsertIntoHistoryTree(
 	ctx context.Context,
 	row *sqlplugin.HistoryTreeRow,
 ) (sql.Result, error) {
-	// DSQL-specific: Convert UUID bytes to strings for VARCHAR fields
-	originalTreeID := row.TreeID
-	originalBranchID := row.BranchID
-	
-	// Convert UUID bytes to string representation for DSQL
-	if len(row.TreeID) == 16 {
-		// This is a UUID in byte format, convert to string
-		treeIDStr := fmt.Sprintf("%x-%x-%x-%x-%x", 
-			row.TreeID[0:4], row.TreeID[4:6], row.TreeID[6:8], row.TreeID[8:10], row.TreeID[10:16])
-		row.TreeID = []byte(treeIDStr)
+	args := map[string]interface{}{
+		"shard_id":      row.ShardID,
+		"tree_id":       UUIDToString(row.TreeID),
+		"branch_id":     UUIDToString(row.BranchID),
+		"data":          row.Data,
+		"data_encoding": row.DataEncoding,
 	}
-	if len(row.BranchID) == 16 {
-		// This is a UUID in byte format, convert to string
-		branchIDStr := fmt.Sprintf("%x-%x-%x-%x-%x", 
-			row.BranchID[0:4], row.BranchID[4:6], row.BranchID[6:8], row.BranchID[8:10], row.BranchID[10:16])
-		row.BranchID = []byte(branchIDStr)
-	}
-	
-	result, err := pdb.NamedExecContext(ctx, addHistoryTreeQuery, row)
-	
-	// Restore original values to avoid side effects
-	row.TreeID = originalTreeID
-	row.BranchID = originalBranchID
-	
-	return result, err
+
+	return pdb.NamedExecContext(ctx, addHistoryTreeQuery, args)
 }
 
 // SelectFromHistoryTree reads one or more rows from history_tree table
@@ -214,7 +189,7 @@ func (pdb *db) SelectFromHistoryTree(
 		&rows,
 		getHistoryTreeQuery,
 		filter.ShardID,
-		filter.TreeID,
+		UUIDToString(filter.TreeID),
 	)
 	return rows, err
 }
@@ -230,8 +205,8 @@ func (pdb *db) PaginateBranchesFromHistoryTree(
 		&rows,
 		paginateBranchesQuery,
 		page.ShardID,
-		page.TreeID,
-		page.BranchID,
+		UUIDToString(page.TreeID),
+		UUIDToString(page.BranchID),
 		page.Limit,
 	)
 	return rows, err
@@ -245,7 +220,7 @@ func (pdb *db) DeleteFromHistoryTree(
 	return pdb.ExecContext(ctx,
 		deleteHistoryTreeQuery,
 		filter.ShardID,
-		filter.TreeID,
-		filter.BranchID,
+		UUIDToString(filter.TreeID),
+		UUIDToString(filter.BranchID),
 	)
 }

@@ -3,6 +3,7 @@ package dsql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 )
@@ -40,11 +41,11 @@ const (
 shard_id, namespace_id, workflow_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding
 FROM current_executions WHERE shard_id = $1 AND namespace_id = $2 AND workflow_id = $3`
 
-	lockCurrentExecutionJoinExecutionsQuery = `SELECT
-ce.shard_id, ce.namespace_id, ce.workflow_id, ce.run_id, ce.create_request_id, ce.state, ce.status, ce.start_time, e.last_write_version, ce.data, ce.data_encoding
-FROM current_executions ce
-INNER JOIN executions e ON e.shard_id = ce.shard_id AND e.namespace_id = ce.namespace_id AND e.workflow_id = ce.workflow_id AND e.run_id = ce.run_id
-WHERE ce.shard_id = $1 AND ce.namespace_id = $2 AND ce.workflow_id = $3 FOR UPDATE`
+	// DSQL note: DSQL only allows FOR UPDATE on a single base table per statement.
+	// Lock current_executions in one statement and read executions metadata separately.
+	getExecutionLastWriteVersionQuery = `SELECT last_write_version
+FROM executions
+WHERE shard_id = $1 AND namespace_id = $2 AND workflow_id = $3 AND run_id = $4`
 
 	lockCurrentExecutionQuery = getCurrentExecutionQuery + ` FOR UPDATE`
 
@@ -414,15 +415,38 @@ func (pdb *db) LockCurrentExecutionsJoinExecutions(
 	ctx context.Context,
 	filter sqlplugin.CurrentExecutionsFilter,
 ) ([]sqlplugin.CurrentExecutionsRow, error) {
-	var rows []sqlplugin.CurrentExecutionsRow
-	err := pdb.SelectContext(ctx,
-		&rows,
-		lockCurrentExecutionJoinExecutionsQuery,
+	// DSQL limitation: locking clauses (FOR UPDATE) can only apply to a single base table per statement.
+	// To preserve semantics, we:
+	//  1) Lock the current_executions row (single-table FOR UPDATE)
+	//  2) Read executions.last_write_version for the corresponding run_id in a separate statement (no FOR UPDATE)
+	// This avoids JOIN ... FOR UPDATE which DSQL rejects with SQLSTATE 0A000.
+
+	var row sqlplugin.CurrentExecutionsRow
+	if err := pdb.GetContext(ctx,
+		&row,
+		lockCurrentExecutionQuery,
 		filter.ShardID,
 		filter.NamespaceID.String(),
 		filter.WorkflowID,
-	)
-	return rows, err
+	); err != nil {
+		return nil, err
+	}
+
+	// Populate last_write_version from executions for the current run.
+	var lastWriteVersion int64
+	if err := pdb.GetContext(ctx,
+		&lastWriteVersion,
+		getExecutionLastWriteVersionQuery,
+		filter.ShardID,
+		filter.NamespaceID.String(),
+		filter.WorkflowID,
+		row.RunID.String(),
+	); err != nil {
+		return nil, err
+	}
+	row.LastWriteVersion = lastWriteVersion
+
+	return []sqlplugin.CurrentExecutionsRow{row}, nil
 }
 
 // InsertIntoHistoryImmediateTasks inserts one or more rows into history_immediate_tasks table
@@ -688,16 +712,22 @@ func (pdb *db) InsertIntoBufferedEvents(
 	rows []sqlplugin.BufferedEventsRow,
 ) (sql.Result, error) {
 	// For buffered events, we need to handle multiple rows
-	// Since we can't use NamedExecContext with UUID conversion easily,
-	// we'll need to insert one by one or use a different approach
+	// DSQL doesn't support BIGSERIAL, so we must generate IDs using Snowflake algorithm
 	for _, row := range rows {
 		namespaceIDStr := row.NamespaceID.String()
 		workflowIDStr := row.WorkflowID
 		runIDStr := row.RunID.String()
 
-		_, err := pdb.ExecContext(ctx,
-			`INSERT INTO buffered_events(shard_id, namespace_id, workflow_id, run_id, data, data_encoding)
-VALUES ($1, $2, $3, $4, $5, $6)`,
+		// Generate unique ID for this buffered event (DSQL requires application-level ID generation)
+		id, err := pdb.idGenerator.NextID(ctx, "buffered_events")
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate buffered_events ID: %w", err)
+		}
+
+		_, err = pdb.ExecContext(ctx,
+			`INSERT INTO buffered_events(id, shard_id, namespace_id, workflow_id, run_id, data, data_encoding)
+VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			id,
 			row.ShardID,
 			namespaceIDStr,
 			workflowIDStr,
