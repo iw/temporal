@@ -150,6 +150,7 @@ func (fwdr *Forwarder) ForwardTask(ctx context.Context, task *internalTask) erro
 				VersionDirective:       task.event.Data.GetVersionDirective(),
 				Stamp:                  task.event.Data.GetStamp(),
 				Priority:               task.event.Data.GetPriority(),
+				ComponentRef:           task.event.Data.GetComponentRef(),
 			},
 		)
 	default:
@@ -249,6 +250,7 @@ func (fwdr *Forwarder) ForwardPoll(ctx context.Context, pollMetadata *pollMetada
 				DeploymentOptions:         pollMetadata.deploymentOptions,
 			},
 			ForwardedSource: fwdr.partition.RpcName(),
+			Conditions:      pollMetadata.conditions,
 		})
 		if err != nil {
 			return nil, fwdr.handleErr(err)
@@ -271,6 +273,7 @@ func (fwdr *Forwarder) ForwardPoll(ctx context.Context, pollMetadata *pollMetada
 				DeploymentOptions:         pollMetadata.deploymentOptions,
 			},
 			ForwardedSource: fwdr.partition.RpcName(),
+			Conditions:      pollMetadata.conditions,
 		})
 		if err != nil {
 			return nil, fwdr.handleErr(err)
@@ -293,6 +296,7 @@ func (fwdr *Forwarder) ForwardPoll(ctx context.Context, pollMetadata *pollMetada
 				// Namespace is ignored here.
 			},
 			ForwardedSource: fwdr.partition.RpcName(),
+			Conditions:      pollMetadata.conditions,
 		})
 		if err != nil {
 			return nil, fwdr.handleErr(err)

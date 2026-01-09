@@ -41,6 +41,12 @@
 - Ensure metrics/alerts exist for Aurora DSQL health and latency; extend `/common/metrics` definitions when necessary.
 - Capture open questions (consistency model, transaction semantics, failure domains) in tracking issues or this document.
 
+## Testing:
+- Write tests for new functionality
+- Run tests after altering code or tests
+- Start with unit tests for fastest feedback
+- Prefer `require` over `assert`, avoid testify suites in unit tests (functional tests require suites for test cluster setup), use `require.Eventually` instead of `time.Sleep` (forbidden by linter)
+
 ## Coordination & Tracking
 - Keep this file updated with new decisions, constraints, and pending investigations.
 - Record owned tasks, open questions, and verification status before handing work to another agent.

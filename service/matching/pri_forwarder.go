@@ -108,6 +108,7 @@ func (f *priForwarder) ForwardTask(ctx context.Context, task *internalTask) erro
 				VersionDirective:       task.event.Data.GetVersionDirective(),
 				Stamp:                  task.event.Data.GetStamp(),
 				Priority:               task.event.Data.GetPriority(),
+				ComponentRef:           task.event.Data.GetComponentRef(),
 			},
 		)
 	default:
@@ -207,6 +208,7 @@ func (f *priForwarder) ForwardPoll(ctx context.Context, pollMetadata *pollMetada
 				DeploymentOptions:         pollMetadata.deploymentOptions,
 			},
 			ForwardedSource: f.partition.RpcName(),
+			Conditions:      pollMetadata.conditions,
 		})
 		if err != nil {
 			return nil, err
@@ -229,6 +231,7 @@ func (f *priForwarder) ForwardPoll(ctx context.Context, pollMetadata *pollMetada
 				DeploymentOptions:         pollMetadata.deploymentOptions,
 			},
 			ForwardedSource: f.partition.RpcName(),
+			Conditions:      pollMetadata.conditions,
 		})
 		if err != nil {
 			return nil, err
@@ -251,6 +254,7 @@ func (f *priForwarder) ForwardPoll(ctx context.Context, pollMetadata *pollMetada
 				// Namespace is ignored here.
 			},
 			ForwardedSource: f.partition.RpcName(),
+			Conditions:      pollMetadata.conditions,
 		})
 		if err != nil {
 			return nil, err
