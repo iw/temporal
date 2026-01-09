@@ -4,6 +4,10 @@ import (
 	"go.temporal.io/server/common/primitives"
 )
 
+// NilUUID is the canonical nil UUID string (all zeros).
+// Used as a minimum value for UUID comparisons in range queries.
+const NilUUID = "00000000-0000-0000-0000-000000000000"
+
 // BytesToUUIDString converts a byte slice to a canonical UUID string format.
 // This is used for DSQL UUID column compatibility where the driver expects
 // string format rather than raw bytes.
