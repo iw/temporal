@@ -4,26 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 )
-
-// bytesToUUIDString safely converts a byte slice to UUID string format
-// Handles empty slices and slices shorter than 16 bytes
-func bytesToUUIDString(id []byte) string {
-	if len(id) == 0 {
-		// Return empty string for empty ID (used in pagination)
-		return ""
-	}
-	if len(id) < 16 {
-		// Pad with zeros if too short
-		padded := make([]byte, 16)
-		copy(padded, id)
-		id = padded
-	}
-	return fmt.Sprintf("%x-%x-%x-%x-%x", id[0:4], id[4:6], id[6:8], id[8:10], id[10:16])
-}
 
 const (
 	createEndpointsTableVersionQry    = `INSERT INTO nexus_endpoints_partition_status(version) VALUES(1)`
@@ -63,8 +46,8 @@ func (pdb *db) InsertIntoNexusEndpoints(
 	ctx context.Context,
 	row *sqlplugin.NexusEndpointsRow,
 ) (sql.Result, error) {
-	// Convert UUID bytes to string for DSQL VARCHAR compatibility
-	idStr := bytesToUUIDString(row.ID)
+	// Convert UUID bytes to string for DSQL UUID column compatibility
+	idStr := BytesToUUIDString(row.ID)
 	return pdb.ExecContext(
 		ctx,
 		createEndpointQry,
@@ -77,8 +60,8 @@ func (pdb *db) UpdateNexusEndpoint(
 	ctx context.Context,
 	row *sqlplugin.NexusEndpointsRow,
 ) (sql.Result, error) {
-	// Convert UUID bytes to string for DSQL VARCHAR compatibility
-	idStr := bytesToUUIDString(row.ID)
+	// Convert UUID bytes to string for DSQL UUID column compatibility
+	idStr := BytesToUUIDString(row.ID)
 	return pdb.ExecContext(
 		ctx,
 		updateEndpointQry,
@@ -93,8 +76,8 @@ func (pdb *db) DeleteFromNexusEndpoints(
 	ctx context.Context,
 	id []byte,
 ) (sql.Result, error) {
-	// Convert UUID bytes to string for DSQL VARCHAR compatibility
-	idStr := bytesToUUIDString(id)
+	// Convert UUID bytes to string for DSQL UUID column compatibility
+	idStr := BytesToUUIDString(id)
 	return pdb.ExecContext(ctx, deleteEndpointQry, idStr)
 }
 
@@ -103,8 +86,8 @@ func (pdb *db) GetNexusEndpointByID(
 	id []byte,
 ) (*sqlplugin.NexusEndpointsRow, error) {
 	var row sqlplugin.NexusEndpointsRow
-	// Convert UUID bytes to string for DSQL VARCHAR compatibility
-	idStr := bytesToUUIDString(id)
+	// Convert UUID bytes to string for DSQL UUID column compatibility
+	idStr := BytesToUUIDString(id)
 	err := pdb.GetContext(ctx, &row, getEndpointByIdQry, idStr)
 	return &row, err
 }
@@ -114,9 +97,9 @@ func (pdb *db) ListNexusEndpoints(
 	request *sqlplugin.ListNexusEndpointsRequest,
 ) ([]sqlplugin.NexusEndpointsRow, error) {
 	var rows []sqlplugin.NexusEndpointsRow
-	// Convert UUID bytes to string for DSQL VARCHAR compatibility
+	// Convert UUID bytes to string for DSQL UUID column compatibility
 	// Handle empty LastID (first call)
-	lastIDStr := bytesToUUIDString(request.LastID)
+	lastIDStr := BytesToUUIDString(request.LastID)
 	err := pdb.SelectContext(ctx, &rows, getEndpointsQry, lastIDStr, request.Limit)
 	return rows, err
 }
