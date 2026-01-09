@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"go.temporal.io/api/serviceerror"
 )
 
 const (
@@ -35,13 +37,6 @@ const (
 		`new_version VARCHAR(64), ` +
 		`old_version VARCHAR(64), ` +
 		`PRIMARY KEY (version_partition, year, month, update_time));`
-
-	// NOTE we have to use %v because somehow postgresql doesn't work with ? here
-	// It's a small bug in sqlx library
-	// TODO https://github.com/uber/cadence/issues/2893
-	createDatabaseQuery = `CREATE DATABASE "%v"`
-
-	dropDatabaseQuery = "DROP DATABASE IF EXISTS %v"
 
 	listTablesQuery = "select table_name from information_schema.tables where table_schema='public'"
 
@@ -91,13 +86,13 @@ func (pdb *db) WriteSchemaUpdateLog(oldVersion string, newVersion string, manife
 
 // ListTables returns a list of tables in this database
 func (pdb *db) ListTables(database string) ([]string, error) {
-    ctx := context.Background()
+	ctx := context.Background()
 
-    var tables []string
-    if err := pdb.SelectContext(ctx, &tables, listTablesQuery); err != nil {
-        return nil, err
-    }
-    return tables, nil
+	var tables []string
+	if err := pdb.SelectContext(ctx, &tables, listTablesQuery); err != nil {
+		return nil, err
+	}
+	return tables, nil
 }
 
 // DropTable drops a given table from the database
@@ -119,19 +114,16 @@ func (pdb *db) DropAllTables(database string) error {
 	return nil
 }
 
-// CreateDatabase creates a database if it doesn't exist
+// CreateDatabase is a no-op for DSQL.
+// DSQL databases are managed through the AWS console or CLI, not through SQL commands.
+// This method exists to satisfy the sqlplugin.AdminDB interface.
 func (pdb *db) CreateDatabase(name string) error {
-	if err := pdb.Exec(fmt.Sprintf(createDatabaseQuery, name)); err != nil {
-		if pdb.IsDupDatabaseError(err) {
-			return nil
-		}
-		return err
-	}
-
-	return nil
+	return serviceerror.NewUnimplemented("CreateDatabase is not supported for DSQL - databases must be created through AWS console or CLI")
 }
 
-// DropDatabase drops a database
+// DropDatabase is a no-op for DSQL.
+// DSQL databases are managed through the AWS console or CLI, not through SQL commands.
+// This method exists to satisfy the sqlplugin.AdminDB interface.
 func (pdb *db) DropDatabase(name string) error {
-	return pdb.Exec(fmt.Sprintf(dropDatabaseQuery, name))
+	return serviceerror.NewUnimplemented("DropDatabase is not supported for DSQL - databases must be deleted through AWS console or CLI")
 }

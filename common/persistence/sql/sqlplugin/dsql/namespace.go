@@ -11,14 +11,6 @@ import (
 )
 
 const (
-	createNamespaceQuery = `INSERT INTO 
- namespaces (partition_id, id, name, is_global, data, data_encoding, notification_version)
- VALUES($1, $2, $3, $4, $5, $6, $7)`
-
-	updateNamespaceQuery = `UPDATE namespaces 
- SET name = $1, data = $2, data_encoding = $3, is_global = $4, notification_version = $5
- WHERE partition_id=54321 AND id = $6`
-
 	getNamespacePart = `SELECT id, name, is_global, data, data_encoding, notification_version FROM namespaces`
 
 	getNamespaceByIDQuery   = getNamespacePart + ` WHERE partition_id=$1 AND id = $2`
@@ -46,18 +38,13 @@ func (pdb *db) InsertIntoNamespace(
 	ctx context.Context,
 	row *sqlplugin.NamespaceRow,
 ) (sql.Result, error) {
-	// Log the row data for debugging
-	fmt.Printf("[DSQL-DEBUG] InsertIntoNamespace: ID=%s, Name=%s, DataType=%T, DataLen=%d, DataEncoding=%s, DataHex=%x\n",
-		row.ID, row.Name, row.Data, len(row.Data), row.DataEncoding, row.Data)
-
-	// Convert UUID to string as otherwise pgx would write the UUID as []byte
+	// Convert UUID to string for DSQL UUID column compatibility
 	idStr := row.ID.String()
 
-	// Use standard query with UUID as string
-	query := `INSERT INTO 
- namespaces (partition_id, id, name, is_global, data, data_encoding, notification_version)
- VALUES($1, $2, $3, $4, $5, $6, $7)`
-	return pdb.ExecContext(ctx, query, partitionID, idStr, row.Name, row.IsGlobal, row.Data, row.DataEncoding, row.NotificationVersion)
+	return pdb.ExecContext(ctx,
+		`INSERT INTO namespaces (partition_id, id, name, is_global, data, data_encoding, notification_version)
+		 VALUES($1, $2, $3, $4, $5, $6, $7)`,
+		partitionID, idStr, row.Name, row.IsGlobal, row.Data, row.DataEncoding, row.NotificationVersion)
 }
 
 // UpdateNamespace updates a single row in namespaces table
@@ -180,15 +167,15 @@ func (pdb *db) DeleteFromNamespace(
 	return result, err
 }
 
-// LockNamespaceMetadata acquires a write lock on a single row in namespace_metadata table
-// DSQL Override: Wraps FOR UPDATE operation in retry logic for SQLSTATE 40001 handling
-// Call-site contract: All subsequent updates must use CAS with notification_version fencing
+// LockNamespaceMetadata acquires a write lock on a single row in namespace_metadata table.
+// DSQL Override: Wraps FOR UPDATE operation in retry logic for SQLSTATE 40001 handling.
+// Call-site contract: All subsequent updates must use CAS with notification_version fencing.
 func (pdb *db) LockNamespaceMetadata(
 	ctx context.Context,
 ) (*sqlplugin.NamespaceMetadataRow, error) {
 	// Use retry manager if available (for non-transaction contexts)
 	if pdb.tx == nil && pdb.retryManager != nil {
-		result, err := pdb.retryManager.RunTx(ctx, "LockNamespaceMetadata", func(tx *sql.Tx) (interface{}, error) {
+		result, err := pdb.retryManager.RunTx(ctx, "LockNamespaceMetadata", func(tx *sql.Tx) (any, error) {
 			var row sqlplugin.NamespaceMetadataRow
 			err := tx.QueryRowContext(ctx, lockNamespaceMetadataQuery, partitionID).Scan(&row.NotificationVersion)
 			if err != nil {
@@ -370,17 +357,13 @@ func (pdb *db) UpdateNamespaceWithCAS(
 	return nil
 }
 
-// UpdateNamespaceWithFencing performs a fenced update on namespaces table using notification_version as fencing token
-// This is the safe method for updating namespaces in DSQL's optimistic concurrency model
+// UpdateNamespaceWithFencing performs a fenced update on namespaces table using notification_version as fencing token.
+// This is the safe method for updating namespaces in DSQL's optimistic concurrency model.
 func (pdb *db) UpdateNamespaceWithFencing(
 	ctx context.Context,
 	row *sqlplugin.NamespaceRow,
 	expectedNotificationVersion int64,
 ) (sql.Result, error) {
-	// Log the row data for debugging
-	fmt.Printf("[DSQL-DEBUG] UpdateNamespaceWithFencing: ID=%s, Name=%s, DataType=%T, DataLen=%d, DataEncoding=%s, DataHex=%x, ExpectedVersion=%d\n",
-		row.ID, row.Name, row.Data, len(row.Data), row.DataEncoding, row.Data, expectedNotificationVersion)
-
 	err := pdb.UpdateNamespaceWithCAS(ctx, row, expectedNotificationVersion)
 	if err != nil {
 		return nil, err
