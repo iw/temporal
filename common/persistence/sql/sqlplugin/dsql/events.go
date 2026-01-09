@@ -5,7 +5,6 @@ import (
 	"database/sql"
 
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
-	"go.temporal.io/server/common/primitives"
 )
 
 const (
@@ -50,42 +49,6 @@ const (
 	deleteHistoryTreeQuery = `DELETE FROM history_tree WHERE shard_id = $1 AND tree_id = $2 AND branch_id = $3 `
 )
 
-// UUIDStringFromPrimitives converts a Temporal primitives.UUID (16-byte) to a canonical UUID string.
-// We bind UUIDs to DSQL as strings to avoid []byte being treated as BYTEA by the driver.
-//
-// If u is empty/nil, returns empty string (call sites should ensure NOT NULL where required).
-func UUIDStringFromPrimitives(u primitives.UUID) string {
-	// primitives.UUID is a []byte alias; expected length is 16.
-	// We format as xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-	if len(u) != 16 {
-		// Keep behavior explicit: callers should not pass invalid UUIDs.
-		// Returning empty string would mask bugs and could violate NOT NULL constraints.
-		panic("invalid primitives.UUID length (expected 16)")
-	}
-	// Manual formatting avoids pulling in extra uuid libraries here.
-	// Matches the canonical UUID string format.
-	return fmtUUID(u)
-}
-
-func fmtUUID(b []byte) string {
-	hex := "0123456789abcdef"
-	out := make([]byte, 36)
-	// 8-4-4-4-12 layout
-	// bytes: 0..15
-	// positions: 0..35 with hyphens at 8,13,18,23
-	j := 0
-	for i := 0; i < 16; i++ {
-		if j == 8 || j == 13 || j == 18 || j == 23 {
-			out[j] = '-'
-			j++
-		}
-		out[j] = hex[b[i]>>4]
-		out[j+1] = hex[b[i]&0x0f]
-		j += 2
-	}
-	return string(out)
-}
-
 // For history_node table:
 
 // InsertIntoHistoryNode inserts a row into history_node table
@@ -97,14 +60,14 @@ func (pdb *db) InsertIntoHistoryNode(
 	txnID := -row.TxnID
 
 	args := map[string]interface{}{
-		"shard_id":       row.ShardID,
-		"tree_id":        UUIDStringFromPrimitives(row.TreeID),
-		"branch_id":      UUIDStringFromPrimitives(row.BranchID),
-		"node_id":        row.NodeID,
-		"prev_txn_id":    row.PrevTxnID,
-		"txn_id":         txnID,
-		"data":           row.Data,
-		"data_encoding":  row.DataEncoding,
+		"shard_id":      row.ShardID,
+		"tree_id":       UUIDToString(row.TreeID),
+		"branch_id":     UUIDToString(row.BranchID),
+		"node_id":       row.NodeID,
+		"prev_txn_id":   row.PrevTxnID,
+		"txn_id":        txnID,
+		"data":          row.Data,
+		"data_encoding": row.DataEncoding,
 	}
 
 	return pdb.NamedExecContext(ctx, addHistoryNodesQuery, args)
@@ -121,8 +84,8 @@ func (pdb *db) DeleteFromHistoryNode(
 	return pdb.ExecContext(ctx,
 		deleteHistoryNodeQuery,
 		row.ShardID,
-		UUIDStringFromPrimitives(row.TreeID),
-		UUIDStringFromPrimitives(row.BranchID),
+		UUIDToString(row.TreeID),
+		UUIDToString(row.BranchID),
 		row.NodeID,
 		txnID,
 	)
@@ -142,8 +105,8 @@ func (pdb *db) RangeSelectFromHistoryNode(
 		query = getHistoryNodesQuery
 	}
 
-	treeID := UUIDStringFromPrimitives(filter.TreeID)
-	branchID := UUIDStringFromPrimitives(filter.BranchID)
+	treeID := UUIDToString(filter.TreeID)
+	branchID := UUIDToString(filter.BranchID)
 
 	var args []interface{}
 	if filter.ReverseOrder {
@@ -192,8 +155,8 @@ func (pdb *db) RangeDeleteFromHistoryNode(
 	return pdb.ExecContext(ctx,
 		deleteHistoryNodesQuery,
 		filter.ShardID,
-		UUIDStringFromPrimitives(filter.TreeID),
-		UUIDStringFromPrimitives(filter.BranchID),
+		UUIDToString(filter.TreeID),
+		UUIDToString(filter.BranchID),
 		filter.MinNodeID,
 	)
 }
@@ -207,8 +170,8 @@ func (pdb *db) InsertIntoHistoryTree(
 ) (sql.Result, error) {
 	args := map[string]interface{}{
 		"shard_id":      row.ShardID,
-		"tree_id":       UUIDStringFromPrimitives(row.TreeID),
-		"branch_id":     UUIDStringFromPrimitives(row.BranchID),
+		"tree_id":       UUIDToString(row.TreeID),
+		"branch_id":     UUIDToString(row.BranchID),
 		"data":          row.Data,
 		"data_encoding": row.DataEncoding,
 	}
@@ -226,7 +189,7 @@ func (pdb *db) SelectFromHistoryTree(
 		&rows,
 		getHistoryTreeQuery,
 		filter.ShardID,
-		UUIDStringFromPrimitives(filter.TreeID),
+		UUIDToString(filter.TreeID),
 	)
 	return rows, err
 }
@@ -242,8 +205,8 @@ func (pdb *db) PaginateBranchesFromHistoryTree(
 		&rows,
 		paginateBranchesQuery,
 		page.ShardID,
-		UUIDStringFromPrimitives(page.TreeID),
-		UUIDStringFromPrimitives(page.BranchID),
+		UUIDToString(page.TreeID),
+		UUIDToString(page.BranchID),
 		page.Limit,
 	)
 	return rows, err
@@ -257,7 +220,7 @@ func (pdb *db) DeleteFromHistoryTree(
 	return pdb.ExecContext(ctx,
 		deleteHistoryTreeQuery,
 		filter.ShardID,
-		UUIDStringFromPrimitives(filter.TreeID),
-		UUIDStringFromPrimitives(filter.BranchID),
+		UUIDToString(filter.TreeID),
+		UUIDToString(filter.BranchID),
 	)
 }
