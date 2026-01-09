@@ -172,8 +172,11 @@ func (pdb *db) rangeSelectFromTaskQueues(
 	var err error
 	var rows []sqlplugin.TaskQueuesRow
 
-	gt := ""
-	if filter.TaskQueueIDGreaterThan != nil {
+	// DSQL: task_queue_id is UUID type, so we need a valid UUID for comparison.
+	// Use nil UUID (all zeros) as the minimum value when no filter is specified.
+	// This ensures "task_queue_id > $N" works correctly with UUID ordering.
+	gt := NilUUID
+	if filter.TaskQueueIDGreaterThan != nil && len(filter.TaskQueueIDGreaterThan) > 0 {
 		gt = TaskQueueIDToUUIDString(filter.TaskQueueIDGreaterThan)
 	}
 
