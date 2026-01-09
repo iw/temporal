@@ -4,19 +4,22 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 
+	"errors"
+
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jmoiron/sqlx"
+	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence/schema"
+	persistsql "go.temporal.io/server/common/persistence/sql"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql/driver"
 	"go.temporal.io/server/common/resolver"
 	postgresqlschemaV12 "go.temporal.io/server/schema/postgresql/v12"
-	"errors"
-	"github.com/jackc/pgx/v5/pgconn"
-	persistsql "go.temporal.io/server/common/persistence/sql"
 )
 
 func (pdb *db) IsDupEntryError(err error) bool {
@@ -38,6 +41,7 @@ type db struct {
 	resolver     resolver.ServiceResolver
 	converter    DataConverter
 	retryManager *RetryManager
+	idGenerator  sqlplugin.IDGenerator // ID generator for tables without BIGSERIAL support
 
 	handle *sqlplugin.DatabaseHandle
 	tx     *sqlx.Tx
@@ -77,6 +81,18 @@ func newDBWithDependencies(
 	}
 	mdb.converter = &converter{}
 
+	// Initialize Snowflake ID generator for DSQL (no BIGSERIAL support)
+	// Use hostname-based node ID for distributed uniqueness
+	hostname, _ := os.Hostname()
+	nodeID := sqlplugin.GetNodeIDFromHostname(hostname)
+	idGen, err := sqlplugin.NewSnowflakeIDGenerator(nodeID, clock.NewRealTimeSource())
+	if err != nil {
+		// Fallback to random ID generator if Snowflake fails
+		mdb.idGenerator = sqlplugin.NewRandomIDGenerator()
+	} else {
+		mdb.idGenerator = idGen
+	}
+
 	// Initialize RetryManager if we have logger and metrics
 	// CRITICAL FIX: Remove the tx == nil condition to enable retry for transactions
 	if logger != nil && metricsHandler != nil && handle != nil {
@@ -95,7 +111,6 @@ func (pdb *db) conn() sqlplugin.Conn {
 	return pdb.handle.Conn()
 }
 
-
 // maybeConvertError preserves raw pg errors for tx-boundary retry classification.
 // Specifically, SQLSTATE 40001 (serialization/OCC conflict) and 0A000 (unsupported feature)
 // must remain visible to the SqlStore tx retry policy.
@@ -113,6 +128,7 @@ func (pdb *db) maybeConvertError(err error) error {
 	}
 	return pdb.handle.ConvertError(err)
 }
+
 // BeginTx starts a new transaction and returns a reference to the Tx object
 func (pdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
 	db, err := pdb.handle.DB()
@@ -239,7 +255,6 @@ func (pdb *db) Rebind(query string) string {
 func (pdb *db) GetRetryManager() *RetryManager {
 	return pdb.retryManager
 }
-
 
 // TxRetryPolicy exposes a tx-boundary retry policy to the SqlStore.
 // This enables retry of entire persistence transactions on SQLSTATE 40001 for Aurora DSQL,

@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/dsql/auth"
+	"github.com/jmoiron/sqlx"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/config"
@@ -150,13 +150,18 @@ func (p *plugin) createDSQLConnectionWithAuth(
 	logger.Info("Creating DSQL connection with IAM authentication",
 		tag.NewStringTag("endpoint", clusterEndpoint),
 		tag.NewStringTag("region", region),
-		tag.NewStringTag("user", dsqlConfig.User))
+		tag.NewStringTag("user", dsqlConfig.User),
+		tag.NewStringTag("token_expiry", "5m"))
 
 	// Use session to create connection (similar to PostgreSQL plugin)
 	dsqlSession, err := session.NewSession(&dsqlConfig, p.driver, resolver)
 	if err != nil {
 		return nil, err
 	}
+
+	logger.Info("DSQL connection established successfully (IAM token refreshed)",
+		tag.NewStringTag("endpoint", clusterEndpoint))
+
 	return dsqlSession.DB, nil
 }
 
@@ -167,9 +172,10 @@ func (p *plugin) generateDbConnectAuthToken(ctx context.Context, region, cluster
 		return "", fmt.Errorf("load aws config: %w", err)
 	}
 
-	// Default token expiry - 15 minutes is standard for DSQL
-	expiry := 15 * time.Minute
-	
+	// Token expiry - 1 hour reduces connection refresh frequency
+	// Default SDK value is 15 minutes, max is 1 week (604,800 seconds)
+	expiry := 1 * time.Hour
+
 	tokenOptions := func(options *auth.TokenOptions) {
 		options.ExpiresIn = expiry
 	}
@@ -188,12 +194,12 @@ func (p *plugin) generateDbConnectAuthToken(ctx context.Context, region, cluster
 			return "", fmt.Errorf("failed to generate auth token: %w", err)
 		}
 	}
-	
-	logger.Debug("Generated DSQL auth token via AWS SDK", 
+
+	logger.Debug("Generated DSQL auth token via AWS SDK",
 		tag.NewStringTag("hostname", clusterEndpoint),
 		tag.NewStringTag("region", region),
 		tag.NewStringTag("action", string(action)),
 		tag.NewStringTag("token_length", fmt.Sprintf("%d", len(token))))
-	
+
 	return token, nil
 }
