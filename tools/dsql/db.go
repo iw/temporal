@@ -2,11 +2,8 @@ package dsql
 
 import (
 	"context"
-	"crypto/md5"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"strings"
@@ -28,25 +25,30 @@ const (
 
 	defaultTokenTTL = 15 * time.Minute
 
-	// Versioning tables (compatible with Temporal schema tooling expectations)
-	// These are intentionally simple and DSQL-safe (no SERIAL/BIGSERIAL).
+	// Versioning tables - must match the structure expected by Temporal server
+	// (see common/persistence/sql/sqlplugin/dsql/admin.go).
+	// These are DSQL-safe (no SERIAL/BIGSERIAL).
 	schemaVersionTableDDL = `
 CREATE TABLE IF NOT EXISTS schema_version (
-  curr_version            VARCHAR(255) NOT NULL,
-  min_compatible_version  VARCHAR(255) NOT NULL,
-  last_updated_time       TIMESTAMP NOT NULL,
-  PRIMARY KEY (curr_version)
+  version_partition       INT NOT NULL,
+  db_name                 VARCHAR(255) NOT NULL,
+  creation_time           TIMESTAMP,
+  curr_version            VARCHAR(64),
+  min_compatible_version  VARCHAR(64),
+  PRIMARY KEY (version_partition, db_name)
 )`
 
 	schemaUpdateHistoryDDL = `
 CREATE TABLE IF NOT EXISTS schema_update_history (
-  id                 BIGINT NOT NULL,
-  old_version        VARCHAR(255) NOT NULL,
-  new_version        VARCHAR(255) NOT NULL,
-  manifest_md5       VARCHAR(255) NOT NULL,
-  description        VARCHAR(1024) NOT NULL,
-  applied_at         TIMESTAMP NOT NULL,
-  PRIMARY KEY (id)
+  version_partition  INT NOT NULL,
+  year               INT NOT NULL,
+  month              INT NOT NULL,
+  update_time        TIMESTAMP NOT NULL,
+  description        VARCHAR(255),
+  manifest_md5       VARCHAR(64),
+  new_version        VARCHAR(64),
+  old_version        VARCHAR(64),
+  PRIMARY KEY (version_partition, year, month, update_time)
 )`
 )
 
@@ -226,19 +228,20 @@ func (d *DSQLSchemaDB) CreateSchemaVersionTables() error {
 	return d.Exec(schemaUpdateHistoryDDL)
 }
 
-// ReadSchemaVersion returns the current schema version
+// ReadSchemaVersion returns the current schema version for the database
 func (d *DSQLSchemaDB) ReadSchemaVersion() (string, error) {
 	ctx := context.Background()
 
-	// There may be multiple rows if versioning was used differently; we use max by updated time.
 	var ver string
 	err := d.db.QueryRowContext(ctx, `
 SELECT curr_version
 FROM schema_version
-ORDER BY last_updated_time DESC
-LIMIT 1`).Scan(&ver)
+WHERE version_partition = 0 AND db_name = 'postgres'`).Scan(&ver)
 	if err == sql.ErrNoRows {
-		return "", nil
+		return "0.0", nil
+	}
+	if ver == "" {
+		return "0.0", nil
 	}
 	return ver, err
 }
@@ -247,10 +250,15 @@ LIMIT 1`).Scan(&ver)
 func (d *DSQLSchemaDB) UpdateSchemaVersion(newVersion string, minCompatibleVersion string) error {
 	ctx := context.Background()
 
-	// Insert a new row to represent the latest version (simple, avoids UPDATE races).
+	// Use UPSERT to handle both insert and update cases
 	stmt := `
-INSERT INTO schema_version (curr_version, min_compatible_version, last_updated_time)
-VALUES ($1, $2, NOW())`
+INSERT INTO schema_version (version_partition, db_name, creation_time, curr_version, min_compatible_version)
+VALUES (0, 'postgres', NOW(), $1, $2)
+ON CONFLICT (version_partition, db_name) DO UPDATE
+SET creation_time = NOW(),
+    curr_version = EXCLUDED.curr_version,
+    min_compatible_version = EXCLUDED.min_compatible_version`
+
 	// one statement per tx
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -267,31 +275,18 @@ VALUES ($1, $2, NOW())`
 func (d *DSQLSchemaDB) WriteSchemaUpdateLog(oldVersion string, newVersion string, manifestMD5 string, desc string) error {
 	ctx := context.Background()
 
-	// Generate a stable-ish id: hash of (old,new,md5,desc,timestamp). Keep simple and monotonic-ish.
-	h := md5.New()
-	_, _ = io.WriteString(h, oldVersion)
-	_, _ = io.WriteString(h, newVersion)
-	_, _ = io.WriteString(h, manifestMD5)
-	_, _ = io.WriteString(h, desc)
-	_, _ = io.WriteString(h, time.Now().UTC().Format(time.RFC3339Nano))
-	idHex := hex.EncodeToString(h.Sum(nil))
-	// take first 16 hex chars as bigint-ish (fits into 64-bit)
-	var id int64
-	_, _ = fmt.Sscanf(idHex[:16], "%x", &id)
-	if id < 0 {
-		id = -id
-	}
+	now := time.Now().UTC()
 
 	stmt := `
 INSERT INTO schema_update_history
-(id, old_version, new_version, manifest_md5, description, applied_at)
-VALUES ($1, $2, $3, $4, $5, NOW())`
+(version_partition, year, month, update_time, old_version, new_version, manifest_md5, description)
+VALUES (0, $1, $2, $3, $4, $5, $6, $7)`
 
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, stmt, id, oldVersion, newVersion, manifestMD5, desc); err != nil {
+	if _, err := tx.ExecContext(ctx, stmt, now.Year(), int(now.Month()), now, oldVersion, newVersion, manifestMD5, desc); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
