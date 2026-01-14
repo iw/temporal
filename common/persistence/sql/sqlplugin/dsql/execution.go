@@ -3,6 +3,7 @@ package dsql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 )
@@ -711,16 +712,22 @@ func (pdb *db) InsertIntoBufferedEvents(
 	rows []sqlplugin.BufferedEventsRow,
 ) (sql.Result, error) {
 	// For buffered events, we need to handle multiple rows
-	// Since we can't use NamedExecContext with UUID conversion easily,
-	// we'll need to insert one by one or use a different approach
+	// DSQL doesn't support BIGSERIAL, so we must generate IDs using Snowflake algorithm
 	for _, row := range rows {
 		namespaceIDStr := row.NamespaceID.String()
 		workflowIDStr := row.WorkflowID
 		runIDStr := row.RunID.String()
 
-		_, err := pdb.ExecContext(ctx,
-			`INSERT INTO buffered_events(shard_id, namespace_id, workflow_id, run_id, data, data_encoding)
-VALUES ($1, $2, $3, $4, $5, $6)`,
+		// Generate unique ID for this buffered event (DSQL requires application-level ID generation)
+		id, err := pdb.idGenerator.NextID(ctx, "buffered_events")
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate buffered_events ID: %w", err)
+		}
+
+		_, err = pdb.ExecContext(ctx,
+			`INSERT INTO buffered_events(id, shard_id, namespace_id, workflow_id, run_id, data, data_encoding)
+VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			id,
 			row.ShardID,
 			namespaceIDStr,
 			workflowIDStr,

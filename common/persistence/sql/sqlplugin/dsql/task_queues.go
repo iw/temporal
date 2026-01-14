@@ -67,24 +67,48 @@ func (pdb *db) InsertIntoTaskQueues(
 }
 
 // UpdateTaskQueues updates a row in task_queues[_v2] table.
-// DSQL Override: Replace unsafe unfenced UPDATE with an auto-fenced CAS update.
-// This preserves the sqlplugin interface while preventing lost updates under DSQL OCC.
 //
-// The auto-fenced update reads the current range_id and attempts a conditional update
-// against that value. It does NOT assume "newRangeID-1".
+// DSQL Note: This function is called within a transaction after lockTaskQueue has already:
+// 1. Read the current range_id with FOR UPDATE
+// 2. Validated that range_id matches the expected PrevRangeID
+//
+// Under DSQL's OCC model:
+// - The FOR UPDATE in lockTaskQueue marks the row in the transaction's read set
+// - If another transaction modifies the row before we commit, DSQL returns SQLSTATE 40001
+// - The txExecute retry loop handles 40001 by retrying the entire transaction
+//
+// Therefore, we can use a simple unfenced UPDATE (matching PostgreSQL behavior) because
+// the transaction-level OCC provides the necessary consistency guarantees.
 func (pdb *db) UpdateTaskQueues(
 	ctx context.Context,
 	row *sqlplugin.TaskQueuesRow,
 	v sqlplugin.MatchingTaskVersion,
 ) (sql.Result, error) {
-	return pdb.UpdateTaskQueuesAutoFenced(ctx, row, v)
+	taskQueueID := TaskQueueIDToUUIDString(row.TaskQueueID)
+
+	args := map[string]interface{}{
+		"range_hash":    row.RangeHash,
+		"task_queue_id": taskQueueID,
+		"range_id":      row.RangeID,
+		"data":          row.Data,
+		"data_encoding": row.DataEncoding,
+	}
+
+	return pdb.NamedExecContext(ctx,
+		sqlplugin.SwitchTaskQueuesTable(updateTaskQueueQry, v),
+		args,
+	)
 }
 
 // UpdateTaskQueuesAutoFenced performs a conditional update without relying on any inferred
 // expected range_id (e.g. "newRangeID-1").
 //
 // It reads the current range_id and attempts to update only if the row is unchanged.
-// If the new range_id is not greater than the current range_id, it returns ConditionFailedError.
+// Updates are allowed when:
+// - row.RangeID == currentRangeID (metadata-only update, e.g., ack level, backlog count)
+// - row.RangeID > currentRangeID (range_id increment for ownership changes)
+// Updates are rejected when:
+// - row.RangeID < currentRangeID (stale update from old owner)
 func (pdb *db) UpdateTaskQueuesAutoFenced(
 	ctx context.Context,
 	row *sqlplugin.TaskQueuesRow,
@@ -108,11 +132,16 @@ func (pdb *db) UpdateTaskQueuesAutoFenced(
 		return nil, err
 	}
 
-	// Enforce monotonicity: range_id must increase.
-	if row.RangeID <= currentRangeID {
+	// Reject stale updates: new range_id must be >= current range_id.
+	// This allows:
+	// - Same range_id (metadata updates like ack level, backlog count)
+	// - Higher range_id (ownership changes)
+	// But rejects:
+	// - Lower range_id (stale updates from old owners)
+	if row.RangeID < currentRangeID {
 		return nil, NewConditionFailedError(
 			ConditionFailedTaskQueue,
-			fmt.Sprintf("task queue %s range_id not increasing (current=%d new=%d)", taskQueueID, currentRangeID, row.RangeID),
+			fmt.Sprintf("task queue %s range_id is stale (current=%d new=%d)", taskQueueID, currentRangeID, row.RangeID),
 		)
 	}
 
@@ -172,8 +201,11 @@ func (pdb *db) rangeSelectFromTaskQueues(
 	var err error
 	var rows []sqlplugin.TaskQueuesRow
 
-	gt := ""
-	if filter.TaskQueueIDGreaterThan != nil {
+	// DSQL: task_queue_id is UUID type, so we need a valid UUID for comparison.
+	// Use nil UUID (all zeros) as the minimum value when no filter is specified.
+	// This ensures "task_queue_id > $N" works correctly with UUID ordering.
+	gt := NilUUID
+	if filter.TaskQueueIDGreaterThan != nil && len(filter.TaskQueueIDGreaterThan) > 0 {
 		gt = TaskQueueIDToUUIDString(filter.TaskQueueIDGreaterThan)
 	}
 
