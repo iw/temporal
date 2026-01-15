@@ -3,6 +3,7 @@ package session
 import (
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/server/common/auth"
@@ -235,4 +236,28 @@ type mockServiceResolver struct {
 
 func (m *mockServiceResolver) Resolve(addr string) []string {
 	return []string{m.addr}
+}
+
+// Tests for DSQL-optimized pool configuration defaults
+
+func TestDSQLPoolDefaults(t *testing.T) {
+	// With the token-refreshing driver, each new connection gets a fresh token,
+	// so MaxConnLifetime doesn't need to be shorter than token duration.
+	// It just needs to be under DSQL's 60 minute connection limit.
+	require.Equal(t, 55*time.Minute, DefaultMaxConnLifetime, "MaxConnLifetime should be 55 minutes (under DSQL's 60 min limit)")
+	require.Equal(t, 5*time.Minute, DefaultMaxConnIdleTime, "MaxConnIdleTime should be 5 minutes")
+	require.Equal(t, 20, DefaultMaxConns, "DefaultMaxConns should be 20")
+	require.Equal(t, 5, DefaultMaxIdleConns, "DefaultMaxIdleConns should be 5")
+}
+
+func TestDSQLPoolDefaults_UnderDSQLLimits(t *testing.T) {
+	// DSQL has a 60 minute max connection duration
+	// Our default should be safely under that
+	dsqlMaxConnDuration := 60 * time.Minute
+	require.Less(t, DefaultMaxConnLifetime, dsqlMaxConnDuration,
+		"DefaultMaxConnLifetime should be less than DSQL's 60 minute limit")
+
+	// Should have at least 5 minutes buffer
+	require.LessOrEqual(t, DefaultMaxConnLifetime, dsqlMaxConnDuration-5*time.Minute,
+		"DefaultMaxConnLifetime should have at least 5 minute buffer before DSQL limit")
 }

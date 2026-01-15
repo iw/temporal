@@ -17,7 +17,7 @@ import (
 	"go.temporal.io/server/common/persistence/schema"
 	persistsql "go.temporal.io/server/common/persistence/sql"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
-	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql/driver"
+	"go.temporal.io/server/common/persistence/sql/sqlplugin/dsql/driver"
 	"go.temporal.io/server/common/resolver"
 	postgresqlschemaV12 "go.temporal.io/server/schema/postgresql/v12"
 )

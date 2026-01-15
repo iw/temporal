@@ -171,3 +171,174 @@ func TestWrapWithConditionFailed(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyError_DSQLSpecificCodes tests DSQL-specific error code classification
+func TestClassifyError_DSQLSpecificCodes(t *testing.T) {
+	tests := []struct {
+		name     string
+		sqlState string
+		message  string
+		expected ErrorType
+	}{
+		// DSQL OCC (Optimistic Concurrency Control) errors - should be retryable
+		{
+			name:     "DSQL OCC data conflict (OC000)",
+			sqlState: "OC000",
+			message:  "mutation conflicts with another transaction",
+			expected: ErrorTypeRetryable,
+		},
+		{
+			name:     "DSQL OCC schema conflict (OC001)",
+			sqlState: "OC001",
+			message:  "schema has been updated by another transaction",
+			expected: ErrorTypeRetryable,
+		},
+
+		// Connection limit errors - should NOT be retryable
+		{
+			name:     "DSQL too many connections (53300)",
+			sqlState: "53300",
+			message:  "too many connections for cluster",
+			expected: ErrorTypeConnectionLimit,
+		},
+		{
+			name:     "DSQL connection rate exceeded (53400)",
+			sqlState: "53400",
+			message:  "connection rate limit exceeded",
+			expected: ErrorTypeConnectionLimit,
+		},
+
+		// Transaction timeout - should NOT be retryable
+		{
+			name:     "DSQL transaction timeout (54000)",
+			sqlState: "54000",
+			message:  "transaction timeout",
+			expected: ErrorTypeTransactionTimeout,
+		},
+
+		// Standard PostgreSQL serialization failure - should be retryable
+		{
+			name:     "PostgreSQL serialization failure (40001)",
+			sqlState: "40001",
+			message:  "could not serialize access due to concurrent update",
+			expected: ErrorTypeRetryable,
+		},
+
+		// Feature not supported - should NOT be retryable
+		{
+			name:     "Feature not supported (0A000)",
+			sqlState: "0A000",
+			message:  "feature not supported",
+			expected: ErrorTypeUnsupportedFeature,
+		},
+
+		// Other errors - permanent
+		{
+			name:     "Unique violation (23505)",
+			sqlState: "23505",
+			message:  "duplicate key value violates unique constraint",
+			expected: ErrorTypePermanent,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := createPgError(tt.sqlState, tt.message)
+			result := ClassifyError(err)
+			assert.Equal(t, tt.expected, result, "Error code %s should be classified as %s", tt.sqlState, tt.expected)
+		})
+	}
+}
+
+// TestIsRetryableError_DSQLSpecificCodes tests retryability of DSQL-specific errors
+func TestIsRetryableError_DSQLSpecificCodes(t *testing.T) {
+	tests := []struct {
+		name      string
+		sqlState  string
+		message   string
+		retryable bool
+	}{
+		// Retryable OCC errors
+		{"OC000 is retryable", "OC000", "mutation conflicts", true},
+		{"OC001 is retryable", "OC001", "schema conflict", true},
+		{"40001 is retryable", "40001", "serialization failure", true},
+
+		// Non-retryable errors
+		{"53300 is not retryable", "53300", "too many connections", false},
+		{"53400 is not retryable", "53400", "rate limit exceeded", false},
+		{"54000 is not retryable", "54000", "transaction timeout", false},
+		{"0A000 is not retryable", "0A000", "feature not supported", false},
+		{"23505 is not retryable", "23505", "unique violation", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := createPgError(tt.sqlState, tt.message)
+			result := IsRetryableError(err)
+			assert.Equal(t, tt.retryable, result)
+		})
+	}
+}
+
+// TestClassifyError_StringBasedFallback tests error classification via string matching
+// when errors are not wrapped as pgconn.PgError
+func TestClassifyError_StringBasedFallback(t *testing.T) {
+	tests := []struct {
+		name     string
+		errMsg   string
+		expected ErrorType
+	}{
+		// DSQL OCC codes in error strings
+		{
+			name:     "OC000 in error string",
+			errMsg:   "server error: FATAL: mutation conflicts with another transaction (SQLSTATE OC000)",
+			expected: ErrorTypeRetryable,
+		},
+		{
+			name:     "OC001 in error string",
+			errMsg:   "ERROR: schema has been updated by another transaction (OC001)",
+			expected: ErrorTypeRetryable,
+		},
+
+		// Connection limit codes in error strings
+		{
+			name:     "53300 in error string",
+			errMsg:   "connection error: too many connections (SQLSTATE 53300)",
+			expected: ErrorTypeConnectionLimit,
+		},
+		{
+			name:     "53400 in error string",
+			errMsg:   "ERROR: connection rate limit exceeded (53400)",
+			expected: ErrorTypeConnectionLimit,
+		},
+
+		// Transaction timeout in error string
+		{
+			name:     "54000 in error string",
+			errMsg:   "ERROR: transaction timeout (SQLSTATE 54000)",
+			expected: ErrorTypeTransactionTimeout,
+		},
+
+		// Serialization failure in error string
+		{
+			name:     "40001 in error string",
+			errMsg:   "could not serialize access due to concurrent update (SQLSTATE 40001)",
+			expected: ErrorTypeRetryable,
+		},
+
+		// No recognizable code - permanent
+		{
+			name:     "unknown error",
+			errMsg:   "some random database error",
+			expected: ErrorTypePermanent,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := errors.New(tt.errMsg)
+			result := ClassifyError(err)
+			assert.Equal(t, tt.expected, result, "Error message '%s' should be classified as %s", tt.errMsg, tt.expected)
+		})
+	}
+}

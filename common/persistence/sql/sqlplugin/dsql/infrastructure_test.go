@@ -58,6 +58,8 @@ func TestErrorTypeString(t *testing.T) {
 		{ErrorTypeConditionFailed, "condition_failed"},
 		{ErrorTypePermanent, "permanent"},
 		{ErrorTypeUnsupportedFeature, "unsupported_feature"},
+		{ErrorTypeConnectionLimit, "connection_limit"},
+		{ErrorTypeTransactionTimeout, "transaction_timeout"},
 		{ErrorTypeUnknown, "unknown"},
 	}
 

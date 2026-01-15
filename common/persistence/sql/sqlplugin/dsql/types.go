@@ -9,6 +9,8 @@ const (
 	ErrorTypeConditionFailed
 	ErrorTypeUnsupportedFeature
 	ErrorTypePermanent
+	ErrorTypeConnectionLimit    // DSQL cluster connection limit reached
+	ErrorTypeTransactionTimeout // DSQL transaction timeout (5 min limit)
 )
 
 func (e ErrorType) String() string {
@@ -21,6 +23,10 @@ func (e ErrorType) String() string {
 		return "unsupported_feature"
 	case ErrorTypePermanent:
 		return "permanent"
+	case ErrorTypeConnectionLimit:
+		return "connection_limit"
+	case ErrorTypeTransactionTimeout:
+		return "transaction_timeout"
 	default:
 		return "unknown"
 	}
