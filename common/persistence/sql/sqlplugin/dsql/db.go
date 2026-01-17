@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"time"
 
 	"errors"
 
@@ -42,6 +43,7 @@ type db struct {
 	converter    DataConverter
 	retryManager *RetryManager
 	idGenerator  sqlplugin.IDGenerator // ID generator for tables without BIGSERIAL support
+	poolMetrics  DSQLMetrics           // Pool metrics collector (only for main DB, not transactions)
 
 	handle *sqlplugin.DatabaseHandle
 	tx     *sqlx.Tx
@@ -98,6 +100,14 @@ func newDBWithDependencies(
 	if logger != nil && metricsHandler != nil && handle != nil {
 		if db, err := handle.DB(); err == nil {
 			mdb.retryManager = NewRetryManager(db.DB, retryConfig, logger, metricsHandler)
+
+			// Start pool metrics collector for non-transaction DB instances
+			// Only start for the main DB, not for transaction-level instances
+			if tx == nil {
+				dsqlMetrics := NewDSQLMetrics(metricsHandler)
+				dsqlMetrics.StartPoolCollector(db.DB, 15*time.Second)
+				mdb.poolMetrics = dsqlMetrics
+			}
 		}
 	}
 
@@ -158,6 +168,10 @@ func (pdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
 
 // Close closes the connection to the dsql db
 func (pdb *db) Close() error {
+	// Stop pool metrics collector if running
+	if pdb.poolMetrics != nil {
+		pdb.poolMetrics.StopPoolCollector()
+	}
 	pdb.handle.Close()
 	return nil
 }
