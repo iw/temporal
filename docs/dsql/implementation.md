@@ -2,6 +2,31 @@
 
 This document covers the technical implementation of Aurora DSQL support in Temporal, including schema changes, OCC handling, and the major contributions to achieve DSQL compatibility.
 
+## Table of Contents
+
+- [Code Structure](#code-structure)
+- [Schema Changes](#schema-changes)
+  - [BYTEA to UUID in Composite Primary Keys](#bytea-to-uuid-in-composite-primary-keys)
+  - [BIGSERIAL Removal](#bigserial-removal)
+  - [Other Schema Changes](#other-schema-changes)
+- [FOR UPDATE and Locking Changes](#for-update-and-locking-changes)
+  - [FOR UPDATE on Single Table Only](#for-update-on-single-table-only)
+  - [FOR SHARE Not Supported](#for-share-not-supported)
+- [Optimistic Concurrency Control (OCC)](#optimistic-concurrency-control-occ)
+  - [Retry Logic](#retry-logic-retrygo)
+  - [Error Classification](#error-classification-errorsgo)
+  - [Transaction Retry Policy](#transaction-retry-policy-tx_retry_policygo)
+- [Compare-And-Swap (CAS) Updates](#compare-and-swap-cas-updates)
+  - [Shard Updates](#shard-updates-shardgo-cas_updatesgo)
+  - [Auto-Fenced Updates](#auto-fenced-updates)
+  - [Generic CAS Helper](#generic-cas-helper)
+- [IAM Authentication](#iam-authentication)
+  - [Token-Refreshing Driver](#token-refreshing-driver-drivertokenrefreshinggo)
+  - [Token Cache](#token-cache-tokencachego)
+- [Connection Rate Limiting](#connection-rate-limiting)
+- [Pool Metrics Collection](#pool-metrics-collection)
+- [Testing](#testing)
+
 ## Code Structure
 
 ```
