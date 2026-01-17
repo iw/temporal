@@ -126,15 +126,36 @@ Aurora DSQL has specific limitations that the plugin handles:
 ## Quick Start
 
 1. **Create DSQL cluster** in AWS Console or via Terraform
-2. **Configure IAM** - ensure Temporal services have `dsql:DbConnect` permission
+
+2. **Configure IAM permissions** for Temporal services:
+   
+   The plugin currently uses admin authentication, which requires:
+   - `dsql:DbConnectAdmin` - Admin access for schema operations and runtime
+   
+   Example IAM policy:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Action": "dsql:DbConnectAdmin",
+       "Resource": "arn:aws:dsql:REGION:ACCOUNT:cluster/CLUSTER_ID"
+     }]
+   }
+   ```
+   
+   See [Aurora DSQL IAM documentation](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/security-iam.html) for details on IAM roles and policies.
+
 3. **Set environment variables**:
    ```bash
    export CLUSTER_ENDPOINT="your-cluster.dsql.us-east-1.on.aws"
    export REGION="us-east-1"
    ```
+
 4. **Initialize schema**:
    ```bash
    temporal-dsql-tool --endpoint $CLUSTER_ENDPOINT --region $REGION \
      setup-schema --schema-name "dsql/v12/temporal" --version 1.12
    ```
+
 5. **Start Temporal** with DSQL configuration
