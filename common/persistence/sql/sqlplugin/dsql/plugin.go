@@ -76,6 +76,14 @@ func (p *plugin) CreateDB(
 	logger log.Logger,
 	metricsHandler metrics.Handler,
 ) (sqlplugin.GenericDB, error) {
+	// Log metrics handler status for debugging
+	if logger != nil {
+		logger.Info("DSQL plugin CreateDB called",
+			tag.NewStringTag("db_kind", dbKind.String()),
+			tag.NewStringTag("database", cfg.DatabaseName),
+			tag.NewBoolTag("has_metrics_handler", metricsHandler != nil))
+	}
+
 	connect := func() (*sqlx.DB, error) {
 		if cfg.Connect != nil {
 			return cfg.Connect(cfg)
