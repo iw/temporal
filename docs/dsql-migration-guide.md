@@ -1,112 +1,48 @@
 # Aurora DSQL Migration Guide
 
-## Overview
-This guide covers migrating Temporal's persistence layer from PostgreSQL to Amazon Aurora DSQL. Aurora DSQL is a PostgreSQL-compatible serverless database that requires specific schema and application modifications for full compatibility.
+This guide covers deploying Temporal with Aurora DSQL as the persistence layer.
 
 ## Prerequisites
-- Aurora DSQL cluster provisioned and accessible
-- Temporal version 1.18+ (schema compatibility baseline)
-- PostgreSQL client tools for initial validation
 
-## Schema Modifications Required
+- Aurora DSQL cluster with public endpoint enabled
+- IAM permissions: `dsql:DbConnect`, `dsql:DbConnectAdmin`
+- AWS credentials configured (IAM role, environment variables, or credentials file)
+- `temporal-dsql-tool` binary for schema setup
 
-### 1. Auto-Increment Columns → Application ID Generation
-**Issue**: DSQL doesn't support `BIGSERIAL` auto-increment.
+## Schema Setup
 
-**Migration**:
-```sql
--- Before (PostgreSQL)
-CREATE TABLE buffered_events (
-    id BIGSERIAL NOT NULL,
-    -- other columns
-);
+### Using temporal-dsql-tool
 
--- After (DSQL)
-CREATE TABLE buffered_events (
-    id BIGINT NOT NULL,
-    -- other columns
-);
-CREATE UNIQUE INDEX idx_buffered_events_id ON buffered_events(id);
+```bash
+# Set environment
+export CLUSTER_ENDPOINT="your-cluster.dsql.us-east-1.on.aws"
+export REGION="us-east-1"
+
+# Setup schema with versioning (required for Temporal server)
+./temporal-dsql-tool \
+    --endpoint "$CLUSTER_ENDPOINT" \
+    --region "$REGION" \
+    setup-schema \
+    --schema-name "dsql/v12/temporal" \
+    --version 1.12
+
+# Reset schema (drops and recreates)
+./temporal-dsql-tool \
+    --endpoint "$CLUSTER_ENDPOINT" \
+    --region "$REGION" \
+    setup-schema \
+    --schema-name "dsql/v12/temporal" \
+    --version 1.12 \
+    --overwrite
 ```
 
-**Application Changes**:
-- Implemented Snowflake-style ID generator in `common/persistence/sql/sqlplugin/idgenerator.go`
-- Thread-safe distributed ID generation (4096 IDs/ms per node)
-- Automatic node ID assignment based on hostname
+The tool uses IAM authentication automatically and has the DSQL schema embedded.
 
-### 2. CHECK Constraints → Application Validation
-**Issue**: DSQL doesn't support CHECK constraints.
+## Configuration
 
-**Migration**:
-```sql
--- Before (PostgreSQL)
-CREATE TABLE nexus_endpoints_partition_status (
-    id INTEGER NOT NULL,
-    CONSTRAINT only_one_row CHECK (id = 0)
-);
-
--- After (DSQL)
-CREATE TABLE nexus_endpoints_partition_status (
-    id INTEGER NOT NULL
-);
-```
-
-**Application Changes**:
-- Added validation in persistence layer operations
-- Proper error handling for constraint violations
-
-### 3. Complex DEFAULT Values → Application Defaults
-**Issue**: DSQL has limited support for complex DEFAULT expressions.
-
-**Migration**:
-```sql
--- Before (PostgreSQL)
-CREATE TABLE cluster_membership (
-    session_start TIMESTAMP DEFAULT '1970-01-01 00:00:01+00:00'
-);
-
--- After (DSQL)
-CREATE TABLE cluster_membership (
-    session_start TIMESTAMP
-);
-```
-
-**Application Changes**:
-- Set default values in Go code before INSERT operations
-- Consistent default handling across all operations
-
-### 4. Inline UNIQUE → Separate Indexes
-**Enhancement**: Better DSQL compatibility with explicit indexes.
-
-**Migration**:
-```sql
--- Before (PostgreSQL)
-CREATE TABLE namespaces (
-    name VARCHAR(255) UNIQUE NOT NULL
-);
-
--- After (DSQL)
-CREATE TABLE namespaces (
-    name VARCHAR(255) NOT NULL
-);
-CREATE UNIQUE INDEX idx_namespaces_name ON namespaces(name);
-```
-
-### 5. Performance Optimizations
-**Enhancement**: Leverage DSQL-specific features.
-
-```sql
--- Use async index creation for better performance
-CREATE INDEX ASYNC cm_idx_rolehost ON cluster_membership (role, host_id);
-```
-
-## Configuration Changes
-
-### 1. Connection Configuration
-Update your Temporal configuration to use DSQL:
+### Static Configuration
 
 ```yaml
-# config/development.yaml
 persistence:
   defaultStore: dsql-default
   datastores:
@@ -114,172 +50,158 @@ persistence:
       sql:
         pluginName: "dsql"
         databaseName: "temporal"
-        connectAddr: "your-dsql-cluster.dsql.us-east-1.on.aws:5432"
-        connectProtocol: "tcp"
-        user: "temporal_user"
-        password: "temporal_password"
-        connectAttributes:
-          sslmode: "require"
-        maxConns: 20
-        maxIdleConns: 20
+        connectAddr: "${CLUSTER_ENDPOINT}:5432"
+        maxConns: 50
+        maxIdleConns: 25
         maxConnLifetime: "1h"
 ```
 
-### 2. Dynamic Configuration
-Optimize for DSQL's characteristics:
+### Environment Variables
+
+```bash
+# Required
+export CLUSTER_ENDPOINT="your-cluster.dsql.us-east-1.on.aws"
+export REGION="us-east-1"  # or AWS_REGION
+
+# Optional - Token refresh
+export DSQL_TOKEN_DURATION="14m"  # Default: 14 minutes
+
+# Optional - Connection rate limiting
+export DSQL_CONNECTION_RATE_LIMIT="10"   # Per-instance rate
+export DSQL_CONNECTION_BURST_LIMIT="100" # Burst capacity
+export DSQL_STAGGERED_STARTUP="true"     # Random startup delay
+```
+
+### Dynamic Configuration
 
 ```yaml
-# config/dynamicconfig/development.yaml
+# Enable DSQL mode
 persistence.enableDSQLMode:
   - value: true
-    constraints: {}
 
-# Higher retry counts for optimistic concurrency control
+# Throughput settings
 history.persistenceMaxQPS:
-  - value: 3000
-    constraints: {}
+  - value: 9000
 
-# Connection pooling for serverless architecture
+matching.persistenceMaxQPS:
+  - value: 9000
+
+frontend.persistenceMaxQPS:
+  - value: 9000
+
+# Connection pool
 persistence.maxConns:
-  - value: 20
-    constraints: {}
+  - value: 50
+
+persistence.maxIdleConns:
+  - value: 25
 ```
 
-## Migration Steps
+## Service-Specific Rate Limits
 
-### Step 1: Schema Migration
-1. **Create DSQL database**:
-   ```bash
-   temporal-sql-tool --plugin dsql --ep your-dsql-cluster.dsql.us-east-1.on.aws:5432 create-database
-   ```
+When running multiple Temporal service replicas, partition the DSQL connection rate limit:
 
-2. **Apply DSQL schema**:
-   ```bash
-   temporal-sql-tool --plugin dsql --ep your-dsql-cluster.dsql.us-east-1.on.aws:5432 setup-schema -v 0.0
-   temporal-sql-tool --plugin dsql --ep your-dsql-cluster.dsql.us-east-1.on.aws:5432 update-schema -d schema/dsql/v12/temporal/versioned
-   ```
+| Service | Replicas | Rate/Instance | Total Rate |
+|---------|----------|---------------|------------|
+| History | 4 | 15/sec | 60/sec |
+| Matching | 3 | 8/sec | 24/sec |
+| Frontend | 2 | 5/sec | 10/sec |
+| Worker | 2 | 3/sec | 6/sec |
+| **Total** | **11** | - | **~100/sec** |
 
-### Step 2: Data Migration (if applicable)
-For existing PostgreSQL data:
+DSQL cluster limit is 100 connections/sec with 1,000 burst capacity.
 
-1. **Export data** from PostgreSQL
-2. **Transform ID columns** (remove auto-increment, ensure unique values)
-3. **Import to DSQL** with proper ID generation
+## Verification
 
-### Step 3: Application Deployment
-1. **Update configuration** files with DSQL connection details
-2. **Deploy Temporal services** with DSQL plugin
-3. **Verify connectivity** and basic operations
+### Check Connectivity
 
-### Step 4: Validation
-1. **Test ID generation** under load
-2. **Verify constraint validation** in application
-3. **Monitor for serialization conflicts**
-4. **Validate performance** meets requirements
+```bash
+# Using psql with IAM token
+TOKEN=$(aws dsql generate-db-connect-admin-auth-token \
+    --hostname "$CLUSTER_ENDPOINT" \
+    --region "$REGION")
 
-## Error Handling
-
-### Serialization Conflicts
-DSQL uses optimistic concurrency control. Handle conflicts:
-
-```go
-// Example retry logic for serialization conflicts
-if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "40001" {
-    // Retry the operation
-    return &persistence.ConditionFailedError{
-        Msg: fmt.Sprintf("DSQL serialization conflict: %s", pqErr.Message),
-    }
-}
+psql "host=$CLUSTER_ENDPOINT user=admin password=$TOKEN sslmode=require" \
+    -c "SELECT version();"
 ```
 
-### Connection Errors
-Monitor and handle DSQL-specific connection patterns:
+### Verify Schema
 
-```go
-// DSQL connection error detection
-dsqlErrors := []string{
-    "dsql cluster unavailable",
-    "dsql endpoint not found",
-    "connection to dsql failed",
-}
+```sql
+-- Check schema version
+SELECT * FROM schema_version;
+
+-- List tables
+SELECT tablename FROM pg_tables WHERE schemaname = 'public';
 ```
 
-## Performance Considerations
+### Test Temporal
 
-### 1. Connection Pooling
-- DSQL is serverless - optimize connection patterns
-- Use appropriate pool sizes (recommended: 20 max connections)
-- Monitor connection metrics and latency
+```bash
+# Create namespace
+temporal operator namespace create default
 
-### 2. Transaction Patterns
-- Implement retry logic for serialization conflicts
-- Keep transactions small and focused
-- Monitor transaction success rates
-
-### 3. Index Strategy
-- Use `CREATE INDEX ASYNC` for large tables
-- Monitor index creation progress
-- Plan index maintenance windows
-
-## Rollback Procedures
-
-### Emergency Rollback to PostgreSQL
-1. **Switch configuration** back to PostgreSQL
-2. **Restart Temporal services**
-3. **Verify data consistency**
-4. **Monitor for issues**
-
-### Gradual Migration
-1. **Use feature flags** to control DSQL usage
-2. **Implement dual-write patterns** during transition
-3. **Validate data consistency** between systems
-4. **Gradually increase DSQL traffic**
-
-## Monitoring & Alerting
-
-### Key Metrics to Monitor
-- **Connection pool utilization**
-- **Serialization conflict rate**
-- **Query latency (p50, p95, p99)**
-- **Error rates by type**
-- **ID generation performance**
-
-### Recommended Alerts
-- High serialization conflict rate (>5%)
-- Connection pool exhaustion
-- Query latency above baseline
-- DSQL cluster unavailability
+# Run a workflow
+temporal workflow start --type MyWorkflow --task-queue my-queue
+```
 
 ## Troubleshooting
 
-### Common Issues
+### Connection Errors
 
-1. **High Serialization Conflicts**
-   - Reduce transaction size
-   - Implement exponential backoff
-   - Review concurrent access patterns
+**"REGION or AWS_REGION environment variable must be set"**
+- Set `REGION` or `AWS_REGION` environment variable
 
-2. **Connection Pool Exhaustion**
-   - Increase pool size
-   - Reduce connection lifetime
-   - Monitor connection leaks
+**"failed to resolve AWS credentials"**
+- Verify IAM role/credentials are configured
+- Check `dsql:DbConnect` permission
 
-3. **ID Generation Collisions**
-   - Verify node ID uniqueness
-   - Check system clock synchronization
-   - Monitor ID generation rate
+**"connection rate limit exceeded"**
+- Reduce `DSQL_CONNECTION_RATE_LIMIT`
+- Enable `DSQL_STAGGERED_STARTUP`
 
-## Support & Resources
+### Serialization Conflicts
 
-- **Implementation**: See `common/persistence/sql/sqlplugin/dsql/` for DSQL plugin
-- **Configuration**: Examples in `config/development-dsql.yaml`
-- **Testing**: Unit tests in `common/persistence/sql/sqlplugin/idgenerator_test.go`
-- **Documentation**: `docs/dsql-schema-compatibility.md` for detailed compatibility matrix
+**High conflict rate (>5%)**
+- Normal under high concurrency
+- Retry logic handles automatically
+- Monitor `dsql_tx_conflict_total` metric
 
-## Next Steps
+**Retry exhaustion**
+- Increase `MaxRetries` in retry config
+- Check for hot spots in data access patterns
 
-After successful migration:
-1. **Performance tuning** based on actual workload
-2. **Multi-region deployment** planning
-3. **Disaster recovery** procedures
-4. **Capacity planning** for growth
+### Pool Exhaustion
+
+**"connection pool exhausted"**
+- Increase `maxConns` in configuration
+- Check for connection leaks
+- Monitor `dsql_pool_in_use` metric
+
+## Rollback to PostgreSQL
+
+1. Update configuration to use PostgreSQL plugin
+2. Restart Temporal services
+3. Verify connectivity and data access
+
+```yaml
+persistence:
+  defaultStore: postgres-default
+  datastores:
+    postgres-default:
+      sql:
+        pluginName: "postgres12"
+        connectAddr: "postgres-host:5432"
+        # ... PostgreSQL settings
+```
+
+## Monitoring
+
+Key metrics to monitor:
+
+- `dsql_tx_conflict_total` - OCC conflicts
+- `dsql_tx_exhausted_total` - Failed after retries
+- `dsql_pool_in_use / dsql_pool_max_open` - Pool saturation
+- `dsql_tx_latency` - Transaction latency
+
+See [Metrics Reference](dsql-metrics.md) for complete list and alerting recommendations.
