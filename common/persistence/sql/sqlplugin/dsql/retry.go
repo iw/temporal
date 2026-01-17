@@ -6,8 +6,12 @@
 // Authoritative retry rules (DSQL plugin):
 //  1. ConditionFailedError (CAS / fencing loss) => NEVER retry, return immediately.
 //  2. SQLSTATE 40001 (serialization failure)     => retry entire transaction.
-//  3. SQLSTATE 0A000 (feature not supported)     => fail fast (implementation bug), no retry.
-//  4. All others                                 => permanent failure, no retry.
+//  3. SQLSTATE OC000 (DSQL OCC data conflict)    => retry entire transaction.
+//  4. SQLSTATE OC001 (DSQL OCC schema conflict)  => retry entire transaction.
+//  5. SQLSTATE 0A000 (feature not supported)     => fail fast (implementation bug), no retry.
+//  6. SQLSTATE 53300 (too many connections)      => fail fast, no retry (cluster limit).
+//  7. SQLSTATE 53400 (connection rate exceeded)  => fail fast, no retry (rate limit).
+//  8. All others                                 => permanent failure, no retry.
 package dsql
 
 import (
@@ -17,12 +21,35 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
+)
+
+// DSQL-specific SQL state codes
+const (
+	// Standard PostgreSQL serialization failure
+	sqlStateSerializationFailure = "40001"
+
+	// DSQL OCC (Optimistic Concurrency Control) error codes
+	// These are DSQL-specific and indicate transaction conflicts
+	sqlStateOCCDataConflict   = "OC000" // mutation conflicts with another transaction
+	sqlStateOCCSchemaConflict = "OC001" // schema has been updated by another transaction
+
+	// Feature not supported
+	sqlStateFeatureNotSupported = "0A000"
+
+	// DSQL connection limit error codes
+	// These indicate cluster-wide resource exhaustion
+	sqlStateTooManyConnections     = "53300" // TOO_MANY_CONNECTIONS - cluster connection limit reached
+	sqlStateConnectionRateExceeded = "53400" // CONFIGURED_LIMIT_EXCEEDED - connection rate limit exceeded
+
+	// Transaction timeout
+	sqlStateTransactionTimeout = "54000" // max transaction time exceeded (5 min for DSQL)
 )
 
 type RetryConfig struct {
@@ -120,7 +147,12 @@ func (r *RetryManager) RunTx(ctx context.Context, op string, fn func(*sql.Tx) (i
 			cls := classifyError(err)
 			r.metrics.IncTxErrorClass(op, cls.String())
 
-			if cls == ErrorTypeConditionFailed || cls == ErrorTypeUnsupportedFeature || cls == ErrorTypePermanent {
+			// Non-retryable errors - fail immediately
+			if cls == ErrorTypeConditionFailed ||
+				cls == ErrorTypeUnsupportedFeature ||
+				cls == ErrorTypePermanent ||
+				cls == ErrorTypeConnectionLimit ||
+				cls == ErrorTypeTransactionTimeout {
 				return zero, err
 			}
 
@@ -206,21 +238,88 @@ func classifyError(err error) ErrorType {
 	if IsConditionFailedError(err) {
 		return ErrorTypeConditionFailed
 	}
+
+	// Try to extract PostgreSQL error code from pgconn.PgError
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		switch pgErr.SQLState() {
-		case "40001":
-			return ErrorTypeRetryable
-		case "0A000":
-			return ErrorTypeUnsupportedFeature
-		default:
-			return ErrorTypePermanent
-		}
+		return classifyByCode(pgErr.SQLState())
 	}
+
+	// Fallback: check error string for DSQL-specific error codes
+	// pgx sometimes wraps errors in a way that doesn't expose PgError directly
+	// Error messages may contain patterns like "SQLSTATE OC000" or "(OC000)"
+	errStr := err.Error()
+	if code := extractSQLStateFromString(errStr); code != "" {
+		return classifyByCode(code)
+	}
+
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ErrorTypePermanent
 	}
 	return ErrorTypePermanent
+}
+
+// classifyByCode classifies an error based on its SQL state code
+func classifyByCode(code string) ErrorType {
+	switch code {
+	// Retryable OCC errors - these should be retried
+	case sqlStateSerializationFailure, // Standard PostgreSQL serialization failure
+		sqlStateOCCDataConflict,   // DSQL: mutation conflicts with another transaction
+		sqlStateOCCSchemaConflict: // DSQL: schema has been updated by another transaction
+		return ErrorTypeRetryable
+
+	// Feature not supported - implementation bug, fail fast
+	case sqlStateFeatureNotSupported:
+		return ErrorTypeUnsupportedFeature
+
+	// Connection limit errors - cluster resource exhaustion, fail fast
+	// These should not be retried as they indicate cluster-wide limits
+	case sqlStateTooManyConnections, // Cluster connection limit reached
+		sqlStateConnectionRateExceeded: // Connection rate limit exceeded
+		return ErrorTypeConnectionLimit
+
+	// Transaction timeout - fail fast, transaction took too long
+	case sqlStateTransactionTimeout:
+		return ErrorTypeTransactionTimeout
+
+	default:
+		return ErrorTypePermanent
+	}
+}
+
+// extractSQLStateFromString attempts to extract a SQL state code from an error string.
+// pgx error messages may contain patterns like:
+// - "SQLSTATE OC000"
+// - "(OC000)"
+// - "error code OC000"
+func extractSQLStateFromString(errStr string) string {
+	// Check for DSQL OCC codes
+	if strings.Contains(errStr, sqlStateOCCDataConflict) {
+		return sqlStateOCCDataConflict
+	}
+	if strings.Contains(errStr, sqlStateOCCSchemaConflict) {
+		return sqlStateOCCSchemaConflict
+	}
+
+	// Check for connection limit codes
+	if strings.Contains(errStr, sqlStateTooManyConnections) {
+		return sqlStateTooManyConnections
+	}
+	if strings.Contains(errStr, sqlStateConnectionRateExceeded) {
+		return sqlStateConnectionRateExceeded
+	}
+
+	// Check for transaction timeout
+	if strings.Contains(errStr, sqlStateTransactionTimeout) {
+		return sqlStateTransactionTimeout
+	}
+
+	// Check for serialization failure
+	if strings.Contains(errStr, sqlStateSerializationFailure) {
+		return sqlStateSerializationFailure
+	}
+
+	return ""
 }
 
 // ClassifyError is the exported version of classifyError for testing

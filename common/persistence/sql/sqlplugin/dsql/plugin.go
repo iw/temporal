@@ -2,13 +2,15 @@ package dsql
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/dsql/auth"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/iancoleman/strcase"
 	"github.com/jmoiron/sqlx"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/clock"
@@ -16,26 +18,16 @@ import (
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
-	"go.temporal.io/server/common/persistence/sql"
+	persistencesql "go.temporal.io/server/common/persistence/sql"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
-	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql/driver"
-	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql/session"
+	"go.temporal.io/server/common/persistence/sql/sqlplugin/dsql/driver"
+	"go.temporal.io/server/common/persistence/sql/sqlplugin/dsql/session"
 	"go.temporal.io/server/common/resolver"
 )
 
 const (
 	// PluginName is the name of the plugin
 	PluginName = "dsql"
-)
-
-// DSQLAction represents the type of DSQL authentication action
-type DSQLAction string
-
-const (
-	// ActionDbConnectAdmin login as user "admin"
-	ActionDbConnectAdmin DSQLAction = "DbConnectAdmin"
-	// ActionDbConnect login as a custom DB role/user
-	ActionDbConnect DSQLAction = "DbConnect"
 )
 
 var defaultDatabaseNames = []string{
@@ -47,12 +39,25 @@ type plugin struct {
 	driver         driver.Driver
 	queryConverter sqlplugin.VisibilityQueryConverter
 	retryConfig    RetryConfig
+
+	// Token cache for IAM authentication (lazily initialized)
+	tokenCacheMu           sync.Mutex
+	tokenCache             *TokenCache
+	credentialsProvider    aws.CredentialsProvider
+	credentialsInitialized bool
+
+	// Connection rate limiter (lazily initialized)
+	rateLimiterOnce sync.Once
+	rateLimiter     *ConnectionRateLimiter
+
+	// Staggered startup (applied once per plugin instance)
+	startupDelayOnce sync.Once
 }
 
 var _ sqlplugin.Plugin = (*plugin)(nil)
 
 func init() {
-	sql.RegisterPlugin(PluginName, &plugin{
+	persistencesql.RegisterPlugin(PluginName, &plugin{
 		driver:         &driver.PGXDriver{},
 		queryConverter: &queryConverter{},
 		retryConfig:    DefaultRetryConfig(),
@@ -75,10 +80,10 @@ func (p *plugin) CreateDB(
 		if cfg.Connect != nil {
 			return cfg.Connect(cfg)
 		}
-		return p.createDSQLConnection(cfg, r, logger)
+		return p.createDSQLConnection(cfg, r, logger, metricsHandler)
 	}
-	needsRefresh := p.driver.IsConnNeedsRefreshError
-	handle := sqlplugin.NewDatabaseHandle(dbKind, connect, needsRefresh, logger, metricsHandler, clock.NewRealTimeSource())
+
+	handle := sqlplugin.NewDatabaseHandle(dbKind, connect, p.driver.IsConnNeedsRefreshError, logger, metricsHandler, clock.NewRealTimeSource())
 	db := newDBWithDependencies(dbKind, cfg.DatabaseName, p.driver, handle, nil, logger, metricsHandler, p.retryConfig)
 	return db, nil
 }
@@ -88,9 +93,10 @@ func (p *plugin) createDSQLConnection(
 	cfg *config.SQL,
 	resolver resolver.ServiceResolver,
 	logger log.Logger,
+	metricsHandler metrics.Handler,
 ) (*sqlx.DB, error) {
 	if cfg.DatabaseName != "" {
-		return p.createDSQLConnectionWithAuth(cfg, resolver, logger)
+		return p.createDSQLConnectionWithAuth(cfg, resolver, logger, metricsHandler)
 	}
 
 	// database name not provided, try defaults
@@ -99,7 +105,7 @@ func (p *plugin) createDSQLConnection(
 	var errors []error
 	for _, databaseName := range defaultDatabaseNames {
 		cfg.DatabaseName = databaseName
-		if db, err := p.createDSQLConnectionWithAuth(cfg, resolver, logger); err == nil {
+		if db, err := p.createDSQLConnectionWithAuth(cfg, resolver, logger, metricsHandler); err == nil {
 			return db, nil
 		} else {
 			errors = append(errors, err)
@@ -110,12 +116,40 @@ func (p *plugin) createDSQLConnection(
 	)
 }
 
-// createDSQLConnectionWithAuth creates a DSQL connection with IAM authentication
+// createDSQLConnectionWithAuth creates a DSQL connection with IAM authentication.
+// It uses a token-refreshing driver that injects fresh IAM tokens before each
+// new connection, ensuring that connections created by the pool (due to MaxConnLifetime,
+// pool growth, or connection failure) always have valid tokens.
 func (p *plugin) createDSQLConnectionWithAuth(
 	cfg *config.SQL,
 	resolver resolver.ServiceResolver,
 	logger log.Logger,
+	metricsHandler metrics.Handler,
 ) (*sqlx.DB, error) {
+	// Apply staggered startup delay (only on first connection)
+	p.startupDelayOnce.Do(func() {
+		if delay := StaggeredStartupDelay(); delay > 0 {
+			logger.Info("Applying staggered startup delay for DSQL",
+				tag.NewDurationTag("delay", delay))
+			time.Sleep(delay)
+		}
+	})
+
+	// Initialize rate limiter (once per plugin)
+	p.rateLimiterOnce.Do(func() {
+		p.rateLimiter = NewConnectionRateLimiter()
+		logger.Info("DSQL connection rate limiter initialized",
+			tag.NewInt("rate_limit", getEnvInt(ConnectionRateLimitEnvVar, DefaultConnectionRateLimit)),
+			tag.NewInt("burst_limit", getEnvInt(ConnectionBurstLimitEnvVar, DefaultConnectionBurstLimit)))
+	})
+
+	// Wait for rate limiter before establishing connection
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := p.rateLimiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("connection rate limit exceeded: %w", err)
+	}
+
 	// Get region from environment variable (following AWS DSQL sample pattern)
 	region := os.Getenv("REGION")
 	if region == "" {
@@ -136,70 +170,176 @@ func (p *plugin) createDSQLConnectionWithAuth(
 		}
 	}
 
-	// Generate DSQL auth token
-	authToken, err := p.generateDbConnectAuthToken(context.Background(), region, clusterEndpoint, ActionDbConnectAdmin, logger)
+	// Get or initialize token cache
+	tokenCache, err := p.getOrInitTokenCache(context.Background(), region, logger, metricsHandler)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate DSQL auth token: %w", err)
+		return nil, fmt.Errorf("failed to initialize token cache: %w", err)
 	}
 
-	// Create modified config with DSQL auth token
-	dsqlConfig := *cfg
-	dsqlConfig.User = "admin" // DSQL admin user
-	dsqlConfig.Password = authToken
+	tokenDuration := GetConfiguredTokenDuration()
 
 	logger.Info("Creating DSQL connection with IAM authentication",
 		tag.NewStringTag("endpoint", clusterEndpoint),
 		tag.NewStringTag("region", region),
-		tag.NewStringTag("user", dsqlConfig.User),
-		tag.NewStringTag("token_expiry", "5m"))
+		tag.NewStringTag("user", adminUser),
+		tag.NewDurationTag("token_duration", tokenDuration))
 
-	// Use session to create connection (similar to PostgreSQL plugin)
-	dsqlSession, err := session.NewSession(&dsqlConfig, p.driver, resolver)
+	// Create a token provider function that the driver will call for each new connection
+	tokenProvider := func(ctx context.Context) (string, error) {
+		token, err := tokenCache.GetToken(ctx, clusterEndpoint, region, adminUser, tokenDuration)
+		if err != nil {
+			logger.Error("Failed to get fresh DSQL token for connection",
+				tag.Error(err),
+				tag.NewStringTag("endpoint", clusterEndpoint))
+			return "", err
+		}
+		logger.Debug("Got fresh DSQL token for new connection",
+			tag.NewStringTag("endpoint", clusterEndpoint))
+		return token, nil
+	}
+
+	// Create the connection using the token-refreshing driver
+	db, err := p.createConnectionWithTokenRefresh(cfg, resolver, tokenProvider, logger)
 	if err != nil {
 		return nil, err
 	}
 
-	logger.Info("DSQL connection established successfully (IAM token refreshed)",
+	logger.Info("DSQL connection established successfully with token-refreshing driver",
 		tag.NewStringTag("endpoint", clusterEndpoint))
 
-	return dsqlSession.DB, nil
+	return db, nil
 }
 
-// generateDbConnectAuthToken generates an IAM auth token for DSQL using AWS SDK
-func (p *plugin) generateDbConnectAuthToken(ctx context.Context, region, clusterEndpoint string, action DSQLAction, logger log.Logger) (string, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+// createConnectionWithTokenRefresh creates a database connection using a custom driver
+// that refreshes IAM tokens before each new connection.
+func (p *plugin) createConnectionWithTokenRefresh(
+	cfg *config.SQL,
+	resolver resolver.ServiceResolver,
+	tokenProvider driver.TokenProvider,
+	logger log.Logger,
+) (*sqlx.DB, error) {
+	// Build the base DSN (with a placeholder password that will be replaced)
+	dsqlConfig := *cfg
+	dsqlConfig.User = adminUser
+	dsqlConfig.Password = "placeholder" // Will be replaced by tokenProvider
+
+	// Use session to build the DSN
+	baseDSN, err := session.BuildDSN(&dsqlConfig, resolver)
 	if err != nil {
-		return "", fmt.Errorf("load aws config: %w", err)
+		return nil, fmt.Errorf("failed to build DSN: %w", err)
 	}
 
-	// Token expiry - 1 hour reduces connection refresh frequency
-	// Default SDK value is 15 minutes, max is 1 week (604,800 seconds)
-	expiry := 1 * time.Hour
-
-	tokenOptions := func(options *auth.TokenOptions) {
-		options.ExpiresIn = expiry
-	}
-
-	var token string
-	if action == ActionDbConnectAdmin {
-		// Use admin auth token for admin user
-		token, err = auth.GenerateDBConnectAdminAuthToken(ctx, clusterEndpoint, region, cfg.Credentials, tokenOptions)
-		if err != nil {
-			return "", fmt.Errorf("failed to generate admin auth token: %w", err)
+	// Register a token-refreshing driver for this connection with logging
+	logFunc := func(msg string, keysAndValues ...interface{}) {
+		// Convert keysAndValues to tags
+		tags := make([]tag.Tag, 0, len(keysAndValues)/2)
+		for i := 0; i < len(keysAndValues)-1; i += 2 {
+			key, ok := keysAndValues[i].(string)
+			if !ok {
+				continue
+			}
+			switch v := keysAndValues[i+1].(type) {
+			case string:
+				tags = append(tags, tag.NewStringTag(key, v))
+			case int64:
+				tags = append(tags, tag.NewInt64(key, v))
+			case int:
+				tags = append(tags, tag.NewInt(key, v))
+			case error:
+				tags = append(tags, tag.Error(v))
+			default:
+				tags = append(tags, tag.NewStringTag(key, fmt.Sprintf("%v", v)))
+			}
 		}
+		logger.Info(msg, tags...)
+	}
+
+	driverName, err := driver.RegisterTokenRefreshingDriverWithLogger(adminUser, tokenProvider, logFunc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register token-refreshing driver: %w", err)
+	}
+
+	logger.Info("Registered token-refreshing driver for DSQL",
+		tag.NewStringTag("driver_name", driverName))
+
+	// Open connection using the token-refreshing driver
+	// The driver will call tokenProvider to get a fresh token before each connection
+	sqlDB, err := sql.Open(driverName, baseDSN)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open DSQL connection: %w", err)
+	}
+
+	// Wrap with sqlx using "pgx" as the driver name for correct bindvar type ($1, $2, etc.)
+	// This is critical - sqlx needs to know it's PostgreSQL-compatible for named parameters
+	db := sqlx.NewDb(sqlDB, "pgx")
+
+	// Apply pool settings
+	if cfg.MaxConns > 0 {
+		db.SetMaxOpenConns(cfg.MaxConns)
 	} else {
-		// Use regular auth token for custom users
-		token, err = auth.GenerateDbConnectAuthToken(ctx, clusterEndpoint, region, cfg.Credentials, tokenOptions)
-		if err != nil {
-			return "", fmt.Errorf("failed to generate auth token: %w", err)
-		}
+		db.SetMaxOpenConns(session.DefaultMaxConns)
 	}
 
-	logger.Debug("Generated DSQL auth token via AWS SDK",
-		tag.NewStringTag("hostname", clusterEndpoint),
-		tag.NewStringTag("region", region),
-		tag.NewStringTag("action", string(action)),
-		tag.NewStringTag("token_length", fmt.Sprintf("%d", len(token))))
+	if cfg.MaxIdleConns > 0 {
+		db.SetMaxIdleConns(cfg.MaxIdleConns)
+	} else {
+		db.SetMaxIdleConns(session.DefaultMaxIdleConns)
+	}
 
-	return token, nil
+	if cfg.MaxConnLifetime > 0 {
+		db.SetConnMaxLifetime(cfg.MaxConnLifetime)
+	} else {
+		db.SetConnMaxLifetime(session.DefaultMaxConnLifetime)
+	}
+
+	db.SetConnMaxIdleTime(session.DefaultMaxConnIdleTime)
+
+	// Maps struct names in CamelCase to snake without need for db struct tags.
+	db.MapperFunc(strcase.ToSnake)
+
+	// Verify connection works
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping DSQL: %w", err)
+	}
+
+	return db, nil
+}
+
+// getOrInitTokenCache returns the token cache, initializing it if necessary.
+// Uses double-checked locking for thread safety.
+func (p *plugin) getOrInitTokenCache(
+	ctx context.Context,
+	region string,
+	logger log.Logger,
+	metricsHandler metrics.Handler,
+) (*TokenCache, error) {
+	// Fast path: already initialized
+	if p.tokenCache != nil && p.credentialsInitialized {
+		return p.tokenCache, nil
+	}
+
+	// Slow path: initialize with lock
+	p.tokenCacheMu.Lock()
+	defer p.tokenCacheMu.Unlock()
+
+	// Double-check after acquiring lock
+	if p.tokenCache != nil && p.credentialsInitialized {
+		return p.tokenCache, nil
+	}
+
+	// Resolve credentials once
+	credentialsProvider, err := ResolveCredentialsProvider(ctx, region)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve AWS credentials: %w", err)
+	}
+
+	p.credentialsProvider = credentialsProvider
+	p.tokenCache = NewTokenCache(credentialsProvider, logger, metricsHandler)
+	p.credentialsInitialized = true
+
+	logger.Info("DSQL token cache initialized",
+		tag.NewStringTag("region", region))
+
+	return p.tokenCache, nil
 }

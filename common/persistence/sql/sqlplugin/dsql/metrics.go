@@ -1,7 +1,10 @@
 package dsql
 
 import (
+	"context"
+	"database/sql"
 	"strconv"
+	"sync"
 	"time"
 
 	"go.temporal.io/server/common/metrics"
@@ -28,6 +31,13 @@ type DSQLMetrics interface {
 	// ObserveTxBackoff records the backoff delay duration
 	ObserveTxBackoff(op string, delay time.Duration)
 
+	// StartPoolCollector starts a background goroutine that periodically samples
+	// connection pool statistics and records them as metrics.
+	StartPoolCollector(db *sql.DB, interval time.Duration)
+
+	// StopPoolCollector stops the background pool metrics collector.
+	StopPoolCollector()
+
 	// GetHandler returns the underlying metrics handler, or nil if not available
 	GetHandler() metrics.Handler
 }
@@ -42,6 +52,14 @@ type dsqlMetricsImpl struct {
 	txRetry      metrics.CounterIface
 	txBackoff    metrics.TimerIface
 
+	// Connection pool metrics
+	poolMaxOpen      metrics.GaugeIface
+	poolOpen         metrics.GaugeIface
+	poolInUse        metrics.GaugeIface
+	poolIdle         metrics.GaugeIface
+	poolWaitCount    metrics.CounterIface
+	poolWaitDuration metrics.TimerIface
+
 	// Legacy metrics for backward compatibility
 	retryCounter              metrics.CounterIface
 	conflictCounter           metrics.CounterIface
@@ -51,6 +69,11 @@ type dsqlMetricsImpl struct {
 	activeTransactions        metrics.GaugeIface
 	errorCounter              metrics.CounterIface
 	unsupportedFeatureCounter metrics.CounterIface
+
+	// Pool collector state
+	poolCollectorMu     sync.Mutex
+	poolCollectorCancel context.CancelFunc
+	lastWaitCount       int64
 }
 
 // NewDSQLMetrics creates a new DSQLMetrics implementation.
@@ -68,6 +91,14 @@ func NewDSQLMetrics(metricsHandler metrics.Handler) DSQLMetrics {
 		txConflict:   metricsHandler.Counter("dsql_tx_conflict_total"),
 		txRetry:      metricsHandler.Counter("dsql_tx_retry_total"),
 		txBackoff:    metricsHandler.Timer("dsql_tx_backoff"),
+
+		// Connection pool metrics
+		poolMaxOpen:      metricsHandler.Gauge("dsql_pool_max_open"),
+		poolOpen:         metricsHandler.Gauge("dsql_pool_open"),
+		poolInUse:        metricsHandler.Gauge("dsql_pool_in_use"),
+		poolIdle:         metricsHandler.Gauge("dsql_pool_idle"),
+		poolWaitCount:    metricsHandler.Counter("dsql_pool_wait_total"),
+		poolWaitDuration: metricsHandler.Timer("dsql_pool_wait_duration"),
 
 		// Legacy metrics for backward compatibility
 		retryCounter:              metricsHandler.Counter("dsql_tx_retries_total"),
@@ -125,6 +156,75 @@ func (m *dsqlMetricsImpl) IncTxRetry(op string, attempt int) {
 // ObserveTxBackoff records the backoff delay duration
 func (m *dsqlMetricsImpl) ObserveTxBackoff(op string, delay time.Duration) {
 	m.txBackoff.Record(delay, metrics.StringTag("operation", op))
+}
+
+// StartPoolCollector starts a background goroutine that periodically samples
+// connection pool statistics and records them as metrics.
+// Call StopPoolCollector to stop the collector when the DB is closed.
+func (m *dsqlMetricsImpl) StartPoolCollector(db *sql.DB, interval time.Duration) {
+	m.poolCollectorMu.Lock()
+	defer m.poolCollectorMu.Unlock()
+
+	// Don't start if already running
+	if m.poolCollectorCancel != nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.poolCollectorCancel = cancel
+
+	go m.runPoolCollector(ctx, db, interval)
+}
+
+// StopPoolCollector stops the background pool metrics collector.
+func (m *dsqlMetricsImpl) StopPoolCollector() {
+	m.poolCollectorMu.Lock()
+	defer m.poolCollectorMu.Unlock()
+
+	if m.poolCollectorCancel != nil {
+		m.poolCollectorCancel()
+		m.poolCollectorCancel = nil
+	}
+}
+
+// runPoolCollector is the background goroutine that samples pool stats.
+func (m *dsqlMetricsImpl) runPoolCollector(ctx context.Context, db *sql.DB, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.recordPoolStats(db)
+		}
+	}
+}
+
+// recordPoolStats samples the current pool statistics and records them.
+func (m *dsqlMetricsImpl) recordPoolStats(db *sql.DB) {
+	stats := db.Stats()
+
+	// Record gauge metrics
+	m.poolMaxOpen.Record(float64(stats.MaxOpenConnections))
+	m.poolOpen.Record(float64(stats.OpenConnections))
+	m.poolInUse.Record(float64(stats.InUse))
+	m.poolIdle.Record(float64(stats.Idle))
+
+	// Record wait count as a counter (delta from last sample)
+	// WaitCount is cumulative, so we track the delta
+	if stats.WaitCount > m.lastWaitCount {
+		delta := stats.WaitCount - m.lastWaitCount
+		m.poolWaitCount.Record(delta)
+	}
+	m.lastWaitCount = stats.WaitCount
+
+	// Record wait duration (cumulative, but we record the current total)
+	// This gives us the total time spent waiting for connections
+	if stats.WaitDuration > 0 {
+		m.poolWaitDuration.Record(stats.WaitDuration)
+	}
 }
 
 // Legacy methods for backward compatibility
@@ -192,12 +292,14 @@ func (m *dsqlMetricsImpl) RecordUnsupportedFeature(operation, feature string) {
 // noOpDSQLMetrics is a no-op implementation of DSQLMetrics for when metrics are disabled
 type noOpDSQLMetrics struct{}
 
-func (n *noOpDSQLMetrics) ObserveTxLatency(op string, latency time.Duration) {}
-func (n *noOpDSQLMetrics) IncTxErrorClass(op string, errorClass string)      {}
-func (n *noOpDSQLMetrics) IncTxExhausted(op string)                          {}
-func (n *noOpDSQLMetrics) IncTxConflict(op string)                           {}
-func (n *noOpDSQLMetrics) IncTxRetry(op string, attempt int)                 {}
-func (n *noOpDSQLMetrics) ObserveTxBackoff(op string, delay time.Duration)   {}
+func (n *noOpDSQLMetrics) ObserveTxLatency(op string, latency time.Duration)     {}
+func (n *noOpDSQLMetrics) IncTxErrorClass(op string, errorClass string)          {}
+func (n *noOpDSQLMetrics) IncTxExhausted(op string)                              {}
+func (n *noOpDSQLMetrics) IncTxConflict(op string)                               {}
+func (n *noOpDSQLMetrics) IncTxRetry(op string, attempt int)                     {}
+func (n *noOpDSQLMetrics) ObserveTxBackoff(op string, delay time.Duration)       {}
+func (n *noOpDSQLMetrics) StartPoolCollector(db *sql.DB, interval time.Duration) {}
+func (n *noOpDSQLMetrics) StopPoolCollector()                                    {}
 
 // DSQLOperationMetrics provides operation-specific metrics recording (legacy)
 type DSQLOperationMetrics struct {

@@ -44,3 +44,11 @@
 
 **/.venv/
 **/.ruff_cache/
+# Build artifacts
+Dockerfile.temporal-dsql
+
+# Terraform state (contains sensitive data)
+terraform.tfstate
+terraform.tfstate.backup
+*.tfstate
+*.tfstate.*
