@@ -150,15 +150,17 @@
    - Configure IAM roles for service authentication
    - Enable automatic secret rotation
    - Integrate with Temporal's secret management capabilities
-8. **🔬 Distributed Connection Rate Limiting**: Research alternatives to manual rate limit partitioning
-   - Current approach requires manually dividing DSQL's 100/sec cluster limit across service instances
-   - Fragile when scaling services or during rolling deployments
-   - Potential approaches to investigate:
-     - **Centralized token bucket**: Redis/DynamoDB-backed distributed rate limiter
-     - **Adaptive rate limiting**: Services dynamically adjust based on `SQLSTATE 53400` feedback
-     - **Service mesh integration**: Envoy-based rate limiting at the connection level
-     - **DSQL-side improvements**: Request AWS to expose rate limit headers or provide per-client quotas
-   - Trade-offs: Added complexity vs. operational simplicity of current static partitioning
+8. **✅ Distributed Connection Rate Limiting**: **IMPLEMENTED** (`dsql-global-rate-limiter` branch)
+   - DynamoDB-backed distributed rate limiter for cluster-wide coordination
+   - Eliminates need for manual rate limit partitioning across service instances
+   - Automatically coordinates across all Temporal services sharing a DSQL cluster
+   - Per-second atomic counters with conditional updates
+   - Graceful fallback to local rate limiting if DynamoDB unavailable
+   - Configuration via environment variables:
+     - `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED=true` - Enable distributed mode
+     - `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE=<table-name>` - DynamoDB table
+     - `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT=100` - Cluster-wide limit (default: 100)
+   - **Important**: Only applies to NEW connection establishment, not queries
 
 ### Known Constraints
 
@@ -211,6 +213,25 @@ The Aurora DSQL persistence layer implementation is now production-ready:
 | P50 Latency | 239 ms |
 | P95 Latency | 3,700 ms |
 | P99 Latency | 11,456 ms |
+
+**🌐 Distributed Rate Limiter (2026-01-19):** (`dsql-global-rate-limiter` branch)
+- **Purpose**: Coordinate DSQL connection rate limiting across all Temporal service instances
+- **Mechanism**: DynamoDB-backed per-second counters with atomic conditional updates
+- **Scope**: Only applies to NEW connection establishment (TCP/TLS + IAM auth), not queries
+- **Files Added**:
+  - `common/persistence/sql/sqlplugin/dsql/distributed_rate_limiter.go` - Core implementation
+  - `common/persistence/sql/sqlplugin/dsql/distributed_rate_limiter_test.go` - Comprehensive tests
+- **Files Modified**:
+  - `common/persistence/sql/sqlplugin/dsql/plugin.go` - Integration with plugin initialization
+  - `go.mod` / `go.sum` - Added DynamoDB SDK dependency
+- **DynamoDB Table Schema**:
+  - Partition key: `pk` (String) - Format: `dsqlconnect#<endpoint>#<unix_second>`
+  - TTL attribute: `ttl_epoch` (Number) - Auto-cleanup after 3 minutes
+- **Configuration**:
+  - `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED=true` - Enable distributed mode
+  - `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE=<table-name>` - DynamoDB table name
+  - `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT=100` - Cluster-wide limit per second
+  - `DSQL_DISTRIBUTED_RATE_LIMITER_MAX_WAIT=30s` - Max wait time for permit
 
 **🔐 Security Recommendations for Production:**
 - **Use AWS Secrets Manager** for database credentials instead of local files

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/iancoleman/strcase"
 	"github.com/jmoiron/sqlx"
 	"go.temporal.io/api/serviceerror"
@@ -47,8 +49,9 @@ type plugin struct {
 	credentialsInitialized bool
 
 	// Connection rate limiter (lazily initialized)
+	// Can be either local (ConnectionRateLimiter) or distributed (DistributedRateLimiter)
 	rateLimiterOnce sync.Once
-	rateLimiter     *ConnectionRateLimiter
+	rateLimiter     driver.RateLimiter
 
 	// Staggered startup (applied once per plugin instance)
 	startupDelayOnce sync.Once
@@ -135,16 +138,6 @@ func (p *plugin) createDSQLConnectionWithAuth(
 		}
 	})
 
-	// Initialize rate limiter (once per plugin)
-	// The rate limiter is passed to the token-refreshing driver so it can
-	// rate-limit ALL connection attempts, including pool growth
-	p.rateLimiterOnce.Do(func() {
-		p.rateLimiter = NewConnectionRateLimiter()
-		logger.Info("DSQL connection rate limiter initialized",
-			tag.NewInt("rate_limit", getEnvInt(ConnectionRateLimitEnvVar, DefaultConnectionRateLimit)),
-			tag.NewInt("burst_limit", getEnvInt(ConnectionBurstLimitEnvVar, DefaultConnectionBurstLimit)))
-	})
-
 	// Get region from environment variable (following AWS DSQL sample pattern)
 	region := os.Getenv("REGION")
 	if region == "" {
@@ -164,6 +157,43 @@ func (p *plugin) createDSQLConnectionWithAuth(
 			clusterEndpoint = strings.Split(clusterEndpoint, ":")[0]
 		}
 	}
+
+	// Initialize rate limiter (once per plugin)
+	// The rate limiter is passed to the token-refreshing driver so it can
+	// rate-limit ALL connection attempts, including pool growth.
+	// Can be either local (per-instance) or distributed (DynamoDB-backed).
+	p.rateLimiterOnce.Do(func() {
+		if IsDistributedRateLimiterEnabled() {
+			// Use distributed rate limiter backed by DynamoDB
+			tableName := GetDistributedRateLimiterTable()
+			if tableName == "" {
+				logger.Error("Distributed rate limiter enabled but DSQL_DISTRIBUTED_RATE_LIMITER_TABLE not set, falling back to local rate limiter")
+				p.rateLimiter = NewConnectionRateLimiter()
+				return
+			}
+
+			// Create DynamoDB client
+			ddbClient, err := p.createDynamoDBClient(context.Background(), region, logger)
+			if err != nil {
+				logger.Error("Failed to create DynamoDB client for distributed rate limiter, falling back to local rate limiter",
+					tag.Error(err))
+				p.rateLimiter = NewConnectionRateLimiter()
+				return
+			}
+
+			p.rateLimiter = NewDistributedRateLimiter(ddbClient, tableName, clusterEndpoint)
+			logger.Info("DSQL distributed rate limiter initialized",
+				tag.NewStringTag("table", tableName),
+				tag.NewStringTag("endpoint", clusterEndpoint),
+				tag.NewInt64("limit_per_second", int64(getEnvInt(DistributedRateLimiterLimitEnvVar, DefaultDistributedRateLimiterLimit))))
+		} else {
+			// Use local rate limiter (per-instance)
+			p.rateLimiter = NewConnectionRateLimiter()
+			logger.Info("DSQL local connection rate limiter initialized",
+				tag.NewInt("rate_limit", getEnvInt(ConnectionRateLimitEnvVar, DefaultConnectionRateLimit)),
+				tag.NewInt("burst_limit", getEnvInt(ConnectionBurstLimitEnvVar, DefaultConnectionBurstLimit)))
+		}
+	})
 
 	// Get or initialize token cache
 	tokenCache, err := p.getOrInitTokenCache(context.Background(), region, logger, metricsHandler)
@@ -337,4 +367,22 @@ func (p *plugin) getOrInitTokenCache(
 		tag.NewStringTag("region", region))
 
 	return p.tokenCache, nil
+}
+
+// createDynamoDBClient creates a DynamoDB client for the distributed rate limiter.
+func (p *plugin) createDynamoDBClient(
+	ctx context.Context,
+	region string,
+	logger log.Logger,
+) (*dynamodb.Client, error) {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	client := dynamodb.NewFromConfig(cfg)
+	logger.Info("Created DynamoDB client for distributed rate limiter",
+		tag.NewStringTag("region", region))
+
+	return client, nil
 }
