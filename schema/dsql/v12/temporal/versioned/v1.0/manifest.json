@@ -1,8 +1,0 @@
-{
-  "CurrVersion": "1.0",
-  "MinCompatibleVersion": "1.0",
-  "Description": "Initial DSQL-compatible schema with VARCHAR primary keys and ASYNC indexes",
-  "SchemaUpdateCqlFiles": [
-    "schema.sql"
-  ]
-}

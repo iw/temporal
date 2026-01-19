@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 
+	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
+	"go.temporal.io/server/common/softassert"
 )
 
 const (
@@ -31,15 +33,25 @@ const (
 	// NOTE: readLockExecutionQuery removed - read-lock clause is not supported by DSQL
 	// Use ReadLockExecutions method which delegates to WriteLockExecutions for DSQL compatibility
 
+	// current_executions queries (for WorkflowArchetypeID)
 	createCurrentExecutionQuery = `INSERT INTO current_executions
 (shard_id, namespace_id, workflow_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding) VALUES
 (:shard_id, :namespace_id, :workflow_id, :run_id, :create_request_id, :state, :status, :start_time, :last_write_version, :data, :data_encoding)`
 
-	deleteCurrentExecutionQuery = "DELETE FROM current_executions WHERE shard_id = $1 AND namespace_id = $2 AND workflow_id = $3 AND run_id = $4"
+	// current_chasm_executions queries (for non-workflow archetypes)
+	createCurrentChasmExecutionQuery = `INSERT INTO current_chasm_executions
+(shard_id, namespace_id, business_id, archetype_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding) VALUES
+(:shard_id, :namespace_id, :workflow_id, :archetype_id, :run_id, :create_request_id, :state, :status, :start_time, :last_write_version, :data, :data_encoding)`
+
+	deleteCurrentExecutionQuery      = "DELETE FROM current_executions WHERE shard_id = $1 AND namespace_id = $2 AND workflow_id = $3 AND run_id = $4"
+	deleteCurrentChasmExecutionQuery = "DELETE FROM current_chasm_executions WHERE shard_id = $1 AND namespace_id = $2 AND business_id = $3 AND archetype_id = $4 AND run_id = $5"
 
 	getCurrentExecutionQuery = `SELECT
 shard_id, namespace_id, workflow_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding
 FROM current_executions WHERE shard_id = $1 AND namespace_id = $2 AND workflow_id = $3`
+	getCurrentChasmExecutionQuery = `SELECT
+shard_id, namespace_id, business_id as workflow_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding
+FROM current_chasm_executions WHERE shard_id = $1 AND namespace_id = $2 AND business_id = $3 AND archetype_id = $4`
 
 	// DSQL note: DSQL only allows FOR UPDATE on a single base table per statement.
 	// Lock current_executions in one statement and read executions metadata separately.
@@ -47,9 +59,10 @@ FROM current_executions WHERE shard_id = $1 AND namespace_id = $2 AND workflow_i
 FROM executions
 WHERE shard_id = $1 AND namespace_id = $2 AND workflow_id = $3 AND run_id = $4`
 
-	lockCurrentExecutionQuery = getCurrentExecutionQuery + ` FOR UPDATE`
+	lockCurrentExecutionQuery      = getCurrentExecutionQuery + ` FOR UPDATE`
+	lockCurrentChasmExecutionQuery = getCurrentChasmExecutionQuery + ` FOR UPDATE`
 
-	updateCurrentExecutionsQuery = `UPDATE current_executions SET
+	updateCurrentExecutionsBase = ` SET
 run_id = :run_id,
 create_request_id = :create_request_id,
 state = :state,
@@ -60,9 +73,10 @@ data = :data,
 data_encoding = :data_encoding
 WHERE
 shard_id = :shard_id AND
-namespace_id = :namespace_id AND
-workflow_id = :workflow_id
+namespace_id = :namespace_id
 `
+	updateCurrentExecutionsQuery      = `UPDATE current_executions` + updateCurrentExecutionsBase + ` AND workflow_id = :workflow_id`
+	updateCurrentChasmExecutionsQuery = `UPDATE current_chasm_executions` + updateCurrentExecutionsBase + ` AND business_id = :workflow_id AND archetype_id = :archetype_id`
 
 	createHistoryImmediateTasksQuery = `INSERT INTO history_immediate_tasks(shard_id, category_id, task_id, data, data_encoding) 
  VALUES(:shard_id, :category_id, :task_id, :data, :data_encoding)`
@@ -302,18 +316,43 @@ func (pdb *db) InsertIntoCurrentExecutions(
 	ctx context.Context,
 	row *sqlplugin.CurrentExecutionsRow,
 ) (sql.Result, error) {
+	if err := pdb.assertArchetypeIDSpecified(row.ArchetypeID); err != nil {
+		return nil, err
+	}
+
 	// Convert UUID fields to strings for DSQL VARCHAR compatibility
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
 
-	return pdb.ExecContext(ctx,
-		`INSERT INTO current_executions
+	if row.ArchetypeID == chasm.WorkflowArchetypeID {
+		return pdb.ExecContext(ctx,
+			`INSERT INTO current_executions
 (shard_id, namespace_id, workflow_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding) VALUES
 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			row.ShardID,
+			namespaceIDStr,
+			workflowIDStr,
+			runIDStr,
+			row.CreateRequestID,
+			row.State,
+			row.Status,
+			row.StartTime,
+			row.LastWriteVersion,
+			row.Data,
+			row.DataEncoding,
+		)
+	}
+
+	// CHASM execution - use current_chasm_executions table
+	return pdb.ExecContext(ctx,
+		`INSERT INTO current_chasm_executions
+(shard_id, namespace_id, business_id, archetype_id, run_id, create_request_id, state, status, start_time, last_write_version, data, data_encoding) VALUES
+($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		row.ShardID,
 		namespaceIDStr,
 		workflowIDStr,
+		row.ArchetypeID,
 		runIDStr,
 		row.CreateRequestID,
 		row.State,
@@ -330,13 +369,18 @@ func (pdb *db) UpdateCurrentExecutions(
 	ctx context.Context,
 	row *sqlplugin.CurrentExecutionsRow,
 ) (sql.Result, error) {
+	if err := pdb.assertArchetypeIDSpecified(row.ArchetypeID); err != nil {
+		return nil, err
+	}
+
 	// Convert UUID fields to strings for DSQL VARCHAR compatibility
 	namespaceIDStr := row.NamespaceID.String()
 	workflowIDStr := row.WorkflowID
 	runIDStr := row.RunID.String()
 
-	return pdb.ExecContext(ctx,
-		`UPDATE current_executions SET
+	if row.ArchetypeID == chasm.WorkflowArchetypeID {
+		return pdb.ExecContext(ctx,
+			`UPDATE current_executions SET
 run_id = $1,
 create_request_id = $2,
 state = $3,
@@ -349,6 +393,36 @@ WHERE
 shard_id = $9 AND
 namespace_id = $10 AND
 workflow_id = $11`,
+			runIDStr,
+			row.CreateRequestID,
+			row.State,
+			row.Status,
+			row.StartTime,
+			row.LastWriteVersion,
+			row.Data,
+			row.DataEncoding,
+			row.ShardID,
+			namespaceIDStr,
+			workflowIDStr,
+		)
+	}
+
+	// CHASM execution - use current_chasm_executions table
+	return pdb.ExecContext(ctx,
+		`UPDATE current_chasm_executions SET
+run_id = $1,
+create_request_id = $2,
+state = $3,
+status = $4,
+start_time = $5,
+last_write_version = $6,
+data = $7,
+data_encoding = $8
+WHERE
+shard_id = $9 AND
+namespace_id = $10 AND
+business_id = $11 AND
+archetype_id = $12`,
 		runIDStr,
 		row.CreateRequestID,
 		row.State,
@@ -360,6 +434,7 @@ workflow_id = $11`,
 		row.ShardID,
 		namespaceIDStr,
 		workflowIDStr,
+		row.ArchetypeID,
 	)
 }
 
@@ -368,14 +443,33 @@ func (pdb *db) SelectFromCurrentExecutions(
 	ctx context.Context,
 	filter sqlplugin.CurrentExecutionsFilter,
 ) (*sqlplugin.CurrentExecutionsRow, error) {
+	if err := pdb.assertArchetypeIDSpecified(filter.ArchetypeID); err != nil {
+		return nil, err
+	}
+
 	var row sqlplugin.CurrentExecutionsRow
-	err := pdb.GetContext(ctx,
-		&row,
-		getCurrentExecutionQuery,
-		filter.ShardID,
-		filter.NamespaceID.String(),
-		filter.WorkflowID,
-	)
+	var err error
+
+	if filter.ArchetypeID == chasm.WorkflowArchetypeID {
+		err = pdb.GetContext(ctx,
+			&row,
+			getCurrentExecutionQuery,
+			filter.ShardID,
+			filter.NamespaceID.String(),
+			filter.WorkflowID,
+		)
+	} else {
+		err = pdb.GetContext(ctx,
+			&row,
+			getCurrentChasmExecutionQuery,
+			filter.ShardID,
+			filter.NamespaceID.String(),
+			filter.WorkflowID,
+			filter.ArchetypeID,
+		)
+	}
+
+	row.ArchetypeID = filter.ArchetypeID
 	return &row, err
 }
 
@@ -384,11 +478,27 @@ func (pdb *db) DeleteFromCurrentExecutions(
 	ctx context.Context,
 	filter sqlplugin.CurrentExecutionsFilter,
 ) (sql.Result, error) {
+	if err := pdb.assertArchetypeIDSpecified(filter.ArchetypeID); err != nil {
+		return nil, err
+	}
+
+	if filter.ArchetypeID == chasm.WorkflowArchetypeID {
+		return pdb.ExecContext(ctx,
+			deleteCurrentExecutionQuery,
+			filter.ShardID,
+			filter.NamespaceID.String(),
+			filter.WorkflowID,
+			filter.RunID.String(),
+		)
+	}
+
+	// CHASM execution - use current_chasm_executions table
 	return pdb.ExecContext(ctx,
-		deleteCurrentExecutionQuery,
+		deleteCurrentChasmExecutionQuery,
 		filter.ShardID,
 		filter.NamespaceID.String(),
 		filter.WorkflowID,
+		filter.ArchetypeID,
 		filter.RunID.String(),
 	)
 }
@@ -398,14 +508,33 @@ func (pdb *db) LockCurrentExecutions(
 	ctx context.Context,
 	filter sqlplugin.CurrentExecutionsFilter,
 ) (*sqlplugin.CurrentExecutionsRow, error) {
+	if err := pdb.assertArchetypeIDSpecified(filter.ArchetypeID); err != nil {
+		return nil, err
+	}
+
 	var row sqlplugin.CurrentExecutionsRow
-	err := pdb.GetContext(ctx,
-		&row,
-		lockCurrentExecutionQuery,
-		filter.ShardID,
-		filter.NamespaceID.String(),
-		filter.WorkflowID,
-	)
+	var err error
+
+	if filter.ArchetypeID == chasm.WorkflowArchetypeID {
+		err = pdb.GetContext(ctx,
+			&row,
+			lockCurrentExecutionQuery,
+			filter.ShardID,
+			filter.NamespaceID.String(),
+			filter.WorkflowID,
+		)
+	} else {
+		err = pdb.GetContext(ctx,
+			&row,
+			lockCurrentChasmExecutionQuery,
+			filter.ShardID,
+			filter.NamespaceID.String(),
+			filter.WorkflowID,
+			filter.ArchetypeID,
+		)
+	}
+
+	row.ArchetypeID = filter.ArchetypeID
 	return &row, err
 }
 
@@ -415,6 +544,10 @@ func (pdb *db) LockCurrentExecutionsJoinExecutions(
 	ctx context.Context,
 	filter sqlplugin.CurrentExecutionsFilter,
 ) ([]sqlplugin.CurrentExecutionsRow, error) {
+	if err := pdb.assertArchetypeIDSpecified(filter.ArchetypeID); err != nil {
+		return nil, err
+	}
+
 	// DSQL limitation: locking clauses (FOR UPDATE) can only apply to a single base table per statement.
 	// To preserve semantics, we:
 	//  1) Lock the current_executions row (single-table FOR UPDATE)
@@ -422,13 +555,28 @@ func (pdb *db) LockCurrentExecutionsJoinExecutions(
 	// This avoids JOIN ... FOR UPDATE which DSQL rejects with SQLSTATE 0A000.
 
 	var row sqlplugin.CurrentExecutionsRow
-	if err := pdb.GetContext(ctx,
-		&row,
-		lockCurrentExecutionQuery,
-		filter.ShardID,
-		filter.NamespaceID.String(),
-		filter.WorkflowID,
-	); err != nil {
+	var err error
+
+	if filter.ArchetypeID == chasm.WorkflowArchetypeID {
+		err = pdb.GetContext(ctx,
+			&row,
+			lockCurrentExecutionQuery,
+			filter.ShardID,
+			filter.NamespaceID.String(),
+			filter.WorkflowID,
+		)
+	} else {
+		err = pdb.GetContext(ctx,
+			&row,
+			lockCurrentChasmExecutionQuery,
+			filter.ShardID,
+			filter.NamespaceID.String(),
+			filter.WorkflowID,
+			filter.ArchetypeID,
+		)
+	}
+
+	if err != nil {
 		return nil, err
 	}
 
@@ -445,6 +593,7 @@ func (pdb *db) LockCurrentExecutionsJoinExecutions(
 		return nil, err
 	}
 	row.LastWriteVersion = lastWriteVersion
+	row.ArchetypeID = filter.ArchetypeID
 
 	return []sqlplugin.CurrentExecutionsRow{row}, nil
 }
@@ -946,4 +1095,12 @@ func (pdb *db) RangeDeleteFromVisibilityTasks(
 		filter.InclusiveMinTaskID,
 		filter.ExclusiveMaxTaskID,
 	)
+}
+
+// assertArchetypeIDSpecified validates that ArchetypeID is specified (not UnspecifiedArchetypeID)
+func (pdb *db) assertArchetypeIDSpecified(archetypeID chasm.ArchetypeID) error {
+	if archetypeID == chasm.UnspecifiedArchetypeID {
+		return softassert.UnexpectedInternalErr(pdb.logger, "ArchetypeID not specified", nil)
+	}
+	return nil
 }

@@ -2,6 +2,16 @@
 
 Aurora DSQL is Amazon's serverless, PostgreSQL-compatible distributed SQL database. This integration enables Temporal to use DSQL as its persistence layer while maintaining full feature parity with existing SQL backends.
 
+## Schema Version
+
+**Current DSQL Schema Version: 1.1**
+
+The DSQL schema includes support for:
+- Workflow executions (`current_executions`, `executions`)
+- CHASM executions (`current_chasm_executions`) - standalone activities, schedulers
+- CHASM component trees (`chasm_node_maps`)
+- Task queues, timers, replication, and visibility tasks
+
 ## Architecture
 
 ```
@@ -219,7 +229,7 @@ Aurora DSQL has specific limitations that the plugin handles:
 5. **Initialize schema**:
    ```bash
    temporal-dsql-tool --endpoint $CLUSTER_ENDPOINT --region $REGION \
-     setup-schema --schema-name "dsql/v12/temporal" --version 1.12
+     setup-schema --schema-name "dsql/temporal" --version 1.1
    ```
 
 6. **Start Temporal** with DSQL configuration

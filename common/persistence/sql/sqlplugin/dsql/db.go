@@ -44,6 +44,7 @@ type db struct {
 	retryManager *RetryManager
 	idGenerator  sqlplugin.IDGenerator // ID generator for tables without BIGSERIAL support
 	poolMetrics  DSQLMetrics           // Pool metrics collector (only for main DB, not transactions)
+	logger       log.Logger            // Logger for assertions and error reporting
 
 	handle *sqlplugin.DatabaseHandle
 	tx     *sqlx.Tx
@@ -80,6 +81,7 @@ func newDBWithDependencies(
 		dbDriver: dbDriver,
 		handle:   handle,
 		tx:       tx,
+		logger:   logger,
 	}
 	mdb.converter = &converter{}
 

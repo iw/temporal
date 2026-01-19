@@ -11,6 +11,16 @@ This guide covers deploying Temporal with Aurora DSQL as the persistence layer.
 
 ## Schema Setup
 
+### Current Schema Version
+
+DSQL schema version: **1.1**
+
+Key tables:
+- `current_executions` - Current workflow executions
+- `current_chasm_executions` - CHASM executions (standalone activities, schedulers)
+- `executions` - Workflow execution state
+- `chasm_node_maps` - CHASM component tree nodes
+
 ### Using temporal-dsql-tool
 
 ```bash
@@ -23,20 +33,38 @@ export REGION="us-east-1"
     --endpoint "$CLUSTER_ENDPOINT" \
     --region "$REGION" \
     setup-schema \
-    --schema-name "dsql/v12/temporal" \
-    --version 1.12
+    --schema-name "dsql/temporal" \
+    --version 1.1
 
 # Reset schema (drops and recreates)
 ./temporal-dsql-tool \
     --endpoint "$CLUSTER_ENDPOINT" \
     --region "$REGION" \
     setup-schema \
-    --schema-name "dsql/v12/temporal" \
-    --version 1.12 \
+    --schema-name "dsql/temporal" \
+    --version 1.1 \
     --overwrite
 ```
 
 The tool uses IAM authentication automatically and has the DSQL schema embedded.
+
+### Upgrading from v1.0 to v1.1
+
+If you have an existing v1.0 deployment:
+
+```bash
+# Update schema to v1.1 (adds current_chasm_executions table)
+./temporal-dsql-tool \
+    --endpoint "$CLUSTER_ENDPOINT" \
+    --region "$REGION" \
+    update-schema \
+    --schema-name "dsql/temporal" \
+    --target-version 1.1
+```
+
+**What's new in v1.1:**
+- `current_chasm_executions` table for CHASM support
+- Enables standalone activities and new scheduler implementations
 
 ## Configuration
 
