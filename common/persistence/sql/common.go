@@ -9,12 +9,14 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"time"
+
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/persistence"
+	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
-	"time"
 )
 
 type TxRetryPolicy interface {
@@ -29,18 +31,20 @@ type TxRetryPolicyProvider interface {
 
 // TODO: Rename all SQL Managers to Stores
 type SqlStore struct {
-	DB     sqlplugin.DB
-	logger log.Logger
+	DB         sqlplugin.DB
+	logger     log.Logger
+	serializer serialization.Serializer
 
 	// txRetryPolicy is optional. When nil, txExecute behavior is unchanged.
 	// DSQL plugin provides a policy to enable tx-boundary retry on SQLSTATE 40001.
 	txRetryPolicy TxRetryPolicy
 }
 
-func NewSqlStore(db sqlplugin.DB, logger log.Logger) SqlStore {
+func NewSQLStore(db sqlplugin.DB, logger log.Logger, serializer serialization.Serializer) SqlStore {
 	store := SqlStore{
-		DB:     db,
-		logger: logger,
+		DB:         db,
+		logger:     logger,
+		serializer: serializer,
 	}
 	if p, ok := db.(TxRetryPolicyProvider); ok {
 		store.txRetryPolicy = p.TxRetryPolicy()

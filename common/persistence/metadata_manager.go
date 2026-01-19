@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"errors"
 
 	enumspb "go.temporal.io/api/enums/v1"
 	namespacepb "go.temporal.io/api/namespace/v1"
@@ -11,6 +12,8 @@ import (
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/primitives"
 )
+
+var ErrWatchNotSupported = errors.New("watch not supported")
 
 type (
 
@@ -258,4 +261,8 @@ func (m *metadataManagerImpl) GetMetadata(
 
 func (m *metadataManagerImpl) Close() {
 	m.persistence.Close()
+}
+
+func (m *metadataManagerImpl) WatchNamespaces(context.Context) (<-chan *NamespaceWatchEvent, error) {
+	return nil, ErrWatchNotSupported
 }
