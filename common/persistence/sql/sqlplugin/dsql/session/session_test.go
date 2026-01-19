@@ -247,7 +247,7 @@ func TestDSQLPoolDefaults(t *testing.T) {
 	require.Equal(t, 55*time.Minute, DefaultMaxConnLifetime, "MaxConnLifetime should be 55 minutes (under DSQL's 60 min limit)")
 	require.Equal(t, 5*time.Minute, DefaultMaxConnIdleTime, "MaxConnIdleTime should be 5 minutes")
 	require.Equal(t, 20, DefaultMaxConns, "DefaultMaxConns should be 20")
-	require.Equal(t, 5, DefaultMaxIdleConns, "DefaultMaxIdleConns should be 5")
+	require.Equal(t, 20, DefaultMaxIdleConns, "DefaultMaxIdleConns should be 20 (matches MaxConns to avoid connection churn)")
 }
 
 func TestDSQLPoolDefaults_UnderDSQLLimits(t *testing.T) {
