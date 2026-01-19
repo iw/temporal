@@ -76,14 +76,6 @@ func (p *plugin) CreateDB(
 	logger log.Logger,
 	metricsHandler metrics.Handler,
 ) (sqlplugin.GenericDB, error) {
-	// Log metrics handler status for debugging
-	if logger != nil {
-		logger.Info("DSQL plugin CreateDB called",
-			tag.NewStringTag("db_kind", dbKind.String()),
-			tag.NewStringTag("database", cfg.DatabaseName),
-			tag.NewBoolTag("has_metrics_handler", metricsHandler != nil))
-	}
-
 	connect := func() (*sqlx.DB, error) {
 		if cfg.Connect != nil {
 			return cfg.Connect(cfg)
@@ -144,19 +136,14 @@ func (p *plugin) createDSQLConnectionWithAuth(
 	})
 
 	// Initialize rate limiter (once per plugin)
+	// The rate limiter is passed to the token-refreshing driver so it can
+	// rate-limit ALL connection attempts, including pool growth
 	p.rateLimiterOnce.Do(func() {
 		p.rateLimiter = NewConnectionRateLimiter()
 		logger.Info("DSQL connection rate limiter initialized",
 			tag.NewInt("rate_limit", getEnvInt(ConnectionRateLimitEnvVar, DefaultConnectionRateLimit)),
 			tag.NewInt("burst_limit", getEnvInt(ConnectionBurstLimitEnvVar, DefaultConnectionBurstLimit)))
 	})
-
-	// Wait for rate limiter before establishing connection
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := p.rateLimiter.Wait(ctx); err != nil {
-		return nil, fmt.Errorf("connection rate limit exceeded: %w", err)
-	}
 
 	// Get region from environment variable (following AWS DSQL sample pattern)
 	region := os.Getenv("REGION")
@@ -262,7 +249,7 @@ func (p *plugin) createConnectionWithTokenRefresh(
 		logger.Info(msg, tags...)
 	}
 
-	driverName, err := driver.RegisterTokenRefreshingDriverWithLogger(adminUser, tokenProvider, logFunc)
+	driverName, err := driver.RegisterTokenRefreshingDriverWithLogger(adminUser, tokenProvider, p.rateLimiter, logFunc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register token-refreshing driver: %w", err)
 	}

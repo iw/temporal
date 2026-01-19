@@ -3,7 +3,6 @@ package dsql
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -206,11 +205,6 @@ func (m *dsqlMetricsImpl) runPoolCollector(ctx context.Context, db *sql.DB, inte
 // recordPoolStats samples the current pool statistics and records them.
 func (m *dsqlMetricsImpl) recordPoolStats(db *sql.DB) {
 	stats := db.Stats()
-
-	// Log pool stats for debugging
-	// TODO: Remove this logging once metrics are confirmed working
-	fmt.Printf("DSQL Pool Stats: MaxOpen=%d, Open=%d, InUse=%d, Idle=%d, WaitCount=%d\n",
-		stats.MaxOpenConnections, stats.OpenConnections, stats.InUse, stats.Idle, stats.WaitCount)
 
 	// Record gauge metrics
 	m.poolMaxOpen.Record(float64(stats.MaxOpenConnections))

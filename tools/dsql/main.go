@@ -7,6 +7,7 @@ import (
 	"github.com/urfave/cli"
 	"go.temporal.io/server/common/headers"
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/log/tag"
 	dbschemas "go.temporal.io/server/schema"
 	"go.temporal.io/server/tools/common/schema"
 )
@@ -20,7 +21,10 @@ func RunTool(args []string) error {
 func cliHandler(c *cli.Context, handler func(c *cli.Context, logger log.Logger) error, logger log.Logger) {
 	quiet := c.GlobalBool(schema.CLIOptQuiet)
 	err := handler(c, logger)
-	if err != nil && !quiet {
+	if err != nil {
+		if !quiet {
+			logger.Error("Schema operation failed", tag.Error(err))
+		}
 		os.Exit(1)
 	}
 }

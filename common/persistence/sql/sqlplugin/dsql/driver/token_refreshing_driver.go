@@ -17,8 +17,16 @@ import (
 // It is called before each new connection is established.
 type TokenProvider func(ctx context.Context) (string, error)
 
+// RateLimiter is an interface for connection rate limiting.
+// This allows the driver to rate-limit ALL connection attempts, including
+// pool growth initiated by database/sql internally.
+type RateLimiter interface {
+	// Wait blocks until a connection can be established within rate limits.
+	Wait(ctx context.Context) error
+}
+
 // LogFunc is a callback for logging driver events.
-type LogFunc func(msg string, keysAndValues ...interface{})
+type LogFunc func(msg string, keysAndValues ...any)
 
 // tokenRefreshingDriver wraps the pgx stdlib driver to inject fresh IAM tokens
 // before each connection. This is necessary because database/sql doesn't support
@@ -28,9 +36,15 @@ type LogFunc func(msg string, keysAndValues ...interface{})
 // or connection failure), it calls driver.Open(dsn). This wrapper intercepts that call,
 // gets a fresh token from the TokenProvider, and modifies the DSN before passing it
 // to the underlying pgx driver.
+//
+// The driver also enforces connection rate limiting to respect DSQL's cluster-wide
+// connection rate limits (100 connections/sec). This is critical because pool growth
+// happens internally in database/sql and would otherwise bypass any rate limiting
+// applied at the application level.
 type tokenRefreshingDriver struct {
 	underlying    driver.Driver
 	tokenProvider TokenProvider
+	rateLimiter   RateLimiter // Rate limiter for connection establishment
 	username      string
 	driverName    string
 	logFunc       LogFunc
@@ -52,11 +66,16 @@ var (
 //
 // The username is used when constructing the DSN with fresh tokens.
 func RegisterTokenRefreshingDriver(username string, tokenProvider TokenProvider) (string, error) {
-	return RegisterTokenRefreshingDriverWithLogger(username, tokenProvider, nil)
+	return RegisterTokenRefreshingDriverWithLogger(username, tokenProvider, nil, nil)
 }
 
-// RegisterTokenRefreshingDriverWithLogger registers a new token-refreshing driver with logging support.
-func RegisterTokenRefreshingDriverWithLogger(username string, tokenProvider TokenProvider, logFunc LogFunc) (string, error) {
+// RegisterTokenRefreshingDriverWithLogger registers a new token-refreshing driver with logging
+// and rate limiting support.
+//
+// The rateLimiter parameter is optional but strongly recommended for DSQL connections.
+// When provided, it ensures ALL connection attempts (including pool growth) respect
+// DSQL's cluster-wide connection rate limits (100 connections/sec).
+func RegisterTokenRefreshingDriverWithLogger(username string, tokenProvider TokenProvider, rateLimiter RateLimiter, logFunc LogFunc) (string, error) {
 	if tokenProvider == nil {
 		return "", fmt.Errorf("tokenProvider cannot be nil")
 	}
@@ -74,6 +93,7 @@ func RegisterTokenRefreshingDriverWithLogger(username string, tokenProvider Toke
 	wrapper := &tokenRefreshingDriver{
 		underlying:    stdlib.GetDefaultDriver(),
 		tokenProvider: tokenProvider,
+		rateLimiter:   rateLimiter,
 		username:      username,
 		driverName:    driverName,
 		logFunc:       logFunc,
@@ -83,10 +103,36 @@ func RegisterTokenRefreshingDriverWithLogger(username string, tokenProvider Toke
 	return driverName, nil
 }
 
-// Open implements driver.Driver. It gets a fresh token and injects it into the DSN
-// before opening the connection with the underlying pgx driver.
+// Open implements driver.Driver. It enforces rate limiting, gets a fresh token,
+// and injects it into the DSN before opening the connection with the underlying pgx driver.
+//
+// Rate limiting is applied here (not just at pool creation) because database/sql
+// calls Open() directly when growing the pool, bypassing any application-level rate limiting.
 func (d *tokenRefreshingDriver) Open(dsn string) (driver.Conn, error) {
 	openNum := d.openCount.Add(1)
+
+	// Create context for this connection attempt
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Apply rate limiting BEFORE attempting connection
+	// This is critical for DSQL which has cluster-wide connection rate limits
+	if d.rateLimiter != nil {
+		if d.logFunc != nil {
+			d.logFunc("Token-refreshing driver waiting for rate limiter",
+				"driver_name", d.driverName,
+				"open_count", openNum)
+		}
+		if err := d.rateLimiter.Wait(ctx); err != nil {
+			if d.logFunc != nil {
+				d.logFunc("Token-refreshing driver rate limit wait failed",
+					"driver_name", d.driverName,
+					"open_count", openNum,
+					"error", err.Error())
+			}
+			return nil, fmt.Errorf("connection rate limit exceeded: %w", err)
+		}
+	}
 
 	// Log that the token-refreshing driver is being used
 	if d.logFunc != nil {
@@ -95,11 +141,11 @@ func (d *tokenRefreshingDriver) Open(dsn string) (driver.Conn, error) {
 			"open_count", openNum)
 	}
 
-	// Get fresh token
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// Get fresh token (use a shorter timeout since we already waited for rate limiter)
+	tokenCtx, tokenCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer tokenCancel()
 
-	token, err := d.tokenProvider(ctx)
+	token, err := d.tokenProvider(tokenCtx)
 	if err != nil {
 		if d.logFunc != nil {
 			d.logFunc("Token-refreshing driver failed to get token",

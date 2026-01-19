@@ -14,7 +14,6 @@ import (
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
-	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence/schema"
 	persistsql "go.temporal.io/server/common/persistence/sql"
@@ -109,22 +108,7 @@ func newDBWithDependencies(
 				dsqlMetrics := NewDSQLMetrics(metricsHandler)
 				dsqlMetrics.StartPoolCollector(db.DB, 15*time.Second)
 				mdb.poolMetrics = dsqlMetrics
-				logger.Info("DSQL pool metrics collector started",
-					tag.NewStringTag("db_kind", dbKind.String()),
-					tag.NewStringTag("db_name", dbName))
 			}
-		} else {
-			logger.Warn("DSQL metrics not initialized: failed to get DB handle",
-				tag.Error(err),
-				tag.NewBoolTag("db_is_nil", db == nil))
-		}
-	} else {
-		// Log why metrics weren't initialized
-		if logger != nil {
-			logger.Warn("DSQL metrics not initialized: missing dependencies",
-				tag.NewBoolTag("has_logger", logger != nil),
-				tag.NewBoolTag("has_metrics_handler", metricsHandler != nil),
-				tag.NewBoolTag("has_handle", handle != nil))
 		}
 	}
 
