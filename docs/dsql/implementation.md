@@ -31,27 +31,28 @@ This document covers the technical implementation of Aurora DSQL support in Temp
 
 ```
 common/persistence/sql/sqlplugin/dsql/
-├── plugin.go                 # Plugin registration, IAM auth, token refresh
-├── db.go                     # Database handle, transaction management
-├── execution.go              # Workflow execution operations
-├── shard.go                  # Shard management with CAS updates
-├── cas_updates.go            # Compare-And-Swap update patterns
-├── fenced_updates.go         # Fenced update helpers
-├── retry.go                  # OCC retry logic with backoff
-├── tx_retry_policy.go        # Transaction-level retry policy
-├── errors.go                 # Error classification (retryable vs permanent)
-├── metrics.go                # DSQL-specific metrics
-├── token_cache.go            # IAM token caching
-├── connection_rate_limiter.go # Connection rate limiting
-├── uuid.go                   # UUID string conversion utilities
-├── typeconv.go               # DateTime conversion
+├── plugin.go                      # Plugin registration, IAM auth, token refresh
+├── db.go                          # Database handle, transaction management
+├── execution.go                   # Workflow execution operations
+├── shard.go                       # Shard management with CAS updates
+├── cas_updates.go                 # Compare-And-Swap update patterns
+├── fenced_updates.go              # Fenced update helpers
+├── retry.go                       # OCC retry logic with backoff
+├── tx_retry_policy.go             # Transaction-level retry policy
+├── errors.go                      # Error classification (retryable vs permanent)
+├── metrics.go                     # DSQL-specific metrics
+├── token_cache.go                 # IAM token caching
+├── connection_rate_limiter.go     # Local (per-instance) rate limiting
+├── distributed_rate_limiter.go    # DynamoDB-backed distributed rate limiting
+├── uuid.go                        # UUID string conversion utilities
+├── typeconv.go                    # DateTime conversion
 ├── driver/
-│   └── token_refreshing.go   # Token-refreshing database driver
+│   └── token_refreshing.go        # Token-refreshing database driver
 └── session/
-    └── session.go            # Connection session management
+    └── session.go                 # Connection session management
 
 schema/dsql/v12/temporal/
-└── schema.sql                # DSQL-compatible schema
+└── schema.sql                     # DSQL-compatible schema
 ```
 
 ## Schema Changes
@@ -434,7 +435,13 @@ func (tc *TokenCache) GetToken(ctx context.Context, endpoint, region, user strin
 
 ## Connection Rate Limiting
 
-DSQL has cluster-wide connection limits (100/sec, 1000 burst).
+DSQL has cluster-wide connection limits (100 new connections/sec, 1000 burst, 10000 max). The plugin provides two rate limiting modes.
+
+**Important**: Rate limiting only applies to NEW connection establishment (TCP/TLS handshake + IAM authentication), not to queries. Once a connection is in the pool, queries flow through without rate limiting.
+
+### Local Rate Limiting (Default)
+
+Per-instance rate limiting using Go's `rate.Limiter`:
 
 ```go
 type ConnectionRateLimiter struct {
@@ -459,6 +466,108 @@ func StaggeredStartupDelay() time.Duration {
     return time.Duration(rand.Int63n(int64(maxDelay)))
 }
 ```
+
+### Distributed Rate Limiting (Recommended for Production)
+
+DynamoDB-backed coordination across all service instances:
+
+```go
+type DistributedRateLimiter struct {
+    ddb            *dynamodb.Client
+    tableName      string
+    endpoint       string
+    LimitPerSecond int64         // Default: 100 (DSQL cluster limit)
+    MaxWait        time.Duration // Default: 30s
+    BackoffBase    time.Duration // Default: 25ms
+}
+
+// Wait blocks until a connection permit can be acquired
+func (l *DistributedRateLimiter) Wait(ctx context.Context) error {
+    return l.Acquire(ctx, 1)
+}
+
+// Acquire reserves n permits for the current second
+func (l *DistributedRateLimiter) Acquire(ctx context.Context, n int64) error {
+    deadline := time.Now().Add(l.MaxWait)
+    
+    for {
+        sec := time.Now().UTC().Unix()
+        ok, err := l.tryAcquireOnce(ctx, sec, n)
+        if ok {
+            return nil
+        }
+        
+        if time.Now().After(deadline) {
+            return fmt.Errorf("timeout acquiring permit")
+        }
+        
+        // Jittered backoff, wait for next second boundary if close
+        time.Sleep(l.jitteredBackoff())
+    }
+}
+
+// tryAcquireOnce attempts atomic increment with conditional check
+func (l *DistributedRateLimiter) tryAcquireOnce(ctx context.Context, sec, n int64) (bool, error) {
+    pk := fmt.Sprintf("dsqlconnect#%s#%d", l.endpoint, sec)
+    
+    _, err := l.ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+        TableName: aws.String(l.tableName),
+        Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: pk}},
+        UpdateExpression: aws.String("SET updated_at_ms = :nowms, ttl_epoch = :ttl ADD #cnt :n"),
+        ExpressionAttributeNames: map[string]string{"#cnt": "count"},
+        ExpressionAttributeValues: map[string]types.AttributeValue{
+            ":n":           &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", n)},
+            ":limitMinusN": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", l.LimitPerSecond-n)},
+            // ... other values
+        },
+        // Allow if: item is new OR current count <= (limit - n)
+        ConditionExpression: aws.String("attribute_not_exists(#cnt) OR #cnt <= :limitMinusN"),
+    })
+    
+    if isConditionalFail(err) {
+        return false, nil // Limit exceeded, retry
+    }
+    return err == nil, err
+}
+```
+
+**DynamoDB Table Schema:**
+- Partition key: `pk` (String) - Format: `dsqlconnect#<endpoint>#<unix_second>`
+- TTL attribute: `ttl_epoch` (Number) - Auto-cleanup after 3 minutes
+
+**Configuration:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED` | `false` | Enable distributed mode |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE` | - | DynamoDB table name |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT` | `100` | Cluster-wide limit/sec |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_MAX_WAIT` | `30s` | Max wait for permit |
+
+### Rate Limiter Integration
+
+The rate limiter is integrated into the token-refreshing driver's `Open()` method, ensuring ALL connection attempts are rate-limited:
+
+```go
+func (d *tokenRefreshingDriver) Open(dsn string) (driver.Conn, error) {
+    // Apply rate limiting BEFORE attempting connection
+    if d.rateLimiter != nil {
+        if err := d.rateLimiter.Wait(ctx); err != nil {
+            return nil, fmt.Errorf("connection rate limit exceeded: %w", err)
+        }
+    }
+    
+    // Get fresh token and open connection
+    token, err := d.tokenProvider(ctx)
+    // ...
+}
+```
+
+This ensures rate limiting applies to:
+- Initial pool creation
+- Pool growth under load (`database/sql` internal connections)
+- Connection replacement after `MaxConnLifetime` expiry
+- Reconnection after connection failures
 
 ## Pool Metrics Collection
 

@@ -54,9 +54,22 @@ Aurora DSQL is Amazon's serverless, PostgreSQL-compatible distributed SQL databa
 - Zero collision rate under concurrent load
 
 ### Connection Rate Limiting
-- Per-instance rate limiting to respect DSQL cluster limits
+
+DSQL has a cluster-wide limit of 100 new connections per second. The plugin provides two rate limiting modes:
+
+#### Local Rate Limiting (Default)
+- Per-instance rate limiting using token bucket algorithm
+- Requires manual partitioning of the 100/sec budget across instances
 - Configurable via environment variables
-- Staggered startup to prevent thundering herd
+
+#### Distributed Rate Limiting (Recommended for Production)
+- DynamoDB-backed coordination across all service instances
+- Automatically enforces the cluster-wide 100/sec limit
+- No manual partitioning required - scales automatically with service count
+- Per-second atomic counters with conditional updates
+- Graceful fallback to local limiting if DynamoDB unavailable
+
+**Important**: Rate limiting only applies to NEW connection establishment (TCP/TLS handshake + IAM authentication), not to queries. Once a connection is in the pool, queries flow through without rate limiting.
 
 ## Configuration
 
@@ -77,14 +90,31 @@ persistence:
 
 ### Environment Variables
 
+#### Core Configuration
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLUSTER_ENDPOINT` | - | DSQL cluster endpoint |
 | `REGION` or `AWS_REGION` | - | AWS region for IAM auth |
 | `DSQL_TOKEN_DURATION` | `14m` | IAM token validity period |
+
+#### Local Rate Limiting
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `DSQL_CONNECTION_RATE_LIMIT` | `10` | Connections per second per instance |
 | `DSQL_CONNECTION_BURST_LIMIT` | `100` | Connection burst capacity |
 | `DSQL_STAGGERED_STARTUP` | `true` | Enable random startup delay |
+| `DSQL_STAGGERED_STARTUP_MAX_DELAY` | `5s` | Maximum startup delay |
+
+#### Distributed Rate Limiting
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED` | `false` | Enable DynamoDB-backed distributed rate limiting |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE` | - | DynamoDB table name (required if enabled) |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT` | `100` | Cluster-wide connections per second |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_MAX_WAIT` | `30s` | Maximum wait time for connection permit |
 
 ### Dynamic Configuration
 
@@ -146,16 +176,50 @@ Aurora DSQL has specific limitations that the plugin handles:
    
    See [Aurora DSQL IAM documentation](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/security-iam.html) for details on IAM roles and policies.
 
-3. **Set environment variables**:
+3. **(Optional) Create DynamoDB table for distributed rate limiting**:
+   
+   If using distributed rate limiting (recommended for production), create a DynamoDB table:
+   
+   ```bash
+   aws dynamodb create-table \
+     --table-name temporal-dsql-rate-limit \
+     --attribute-definitions AttributeName=pk,AttributeType=S \
+     --key-schema AttributeName=pk,KeyType=HASH \
+     --billing-mode PAY_PER_REQUEST \
+     --region us-east-1
+   
+   # Enable TTL for automatic cleanup
+   aws dynamodb update-time-to-live \
+     --table-name temporal-dsql-rate-limit \
+     --time-to-live-specification Enabled=true,AttributeName=ttl_epoch \
+     --region us-east-1
+   ```
+   
+   Add DynamoDB permissions to your IAM policy:
+   ```json
+   {
+     "Effect": "Allow",
+     "Action": [
+       "dynamodb:UpdateItem"
+     ],
+     "Resource": "arn:aws:dynamodb:REGION:ACCOUNT:table/temporal-dsql-rate-limit"
+   }
+   ```
+
+4. **Set environment variables**:
    ```bash
    export CLUSTER_ENDPOINT="your-cluster.dsql.us-east-1.on.aws"
    export REGION="us-east-1"
+   
+   # For distributed rate limiting (optional but recommended)
+   export DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED="true"
+   export DSQL_DISTRIBUTED_RATE_LIMITER_TABLE="temporal-dsql-rate-limit"
    ```
 
-4. **Initialize schema**:
+5. **Initialize schema**:
    ```bash
    temporal-dsql-tool --endpoint $CLUSTER_ENDPOINT --region $REGION \
      setup-schema --schema-name "dsql/v12/temporal" --version 1.12
    ```
 
-5. **Start Temporal** with DSQL configuration
+6. **Start Temporal** with DSQL configuration
