@@ -23,28 +23,33 @@ const (
 //   - IAM tokens expire after 15 minutes (configurable via DSQL_TOKEN_DURATION)
 //   - With token-refreshing driver, MaxConnLifetime can be longer since each
 //     new connection gets a fresh token
-//   - Serverless architecture benefits from reasonable idle timeout
-//   - Conservative defaults that can be overridden via config
+//   - Pool MUST stay at max size to avoid connection creation under load
+//     (DSQL has 100 conn/sec cluster-wide rate limit)
+//   - Pool is pre-warmed at startup to eliminate cold-start latency
 const (
 	// DefaultMaxConnLifetime is 55 minutes, safely under DSQL's 60 minute limit.
 	// With the token-refreshing driver, each new connection gets a fresh token,
 	// so this doesn't need to be shorter than token duration.
 	DefaultMaxConnLifetime = 55 * time.Minute
 
-	// DefaultMaxConnIdleTime is 5 minutes.
-	// Idle connections are closed to free up cluster resources in DSQL's
-	// serverless architecture.
-	DefaultMaxConnIdleTime = 5 * time.Minute
+	// DefaultMaxConnIdleTime is 0 (disabled).
+	// CRITICAL: Must be 0 to prevent pool decay. Go's database/sql closes
+	// connections idle longer than this, even if MaxIdleConns allows them.
+	// With DSQL's 100 conn/sec rate limit, we cannot afford to recreate
+	// connections under load - the pool must stay at max size always.
+	DefaultMaxConnIdleTime = 0
 
 	// DefaultMaxConns is the default maximum number of open connections.
-	// Conservative default suitable for most deployments.
-	DefaultMaxConns = 20
+	// Set to 100 to handle shard acquisition bursts and high concurrency workloads.
+	// Each Temporal service creates multiple pools, so total connections per service
+	// can be 4x this value (e.g., 400 connections for history service).
+	DefaultMaxConns = 100
 
 	// DefaultMaxIdleConns is the default maximum number of idle connections.
-	// Should match MaxConns to avoid connection churn - when idle connections
+	// MUST equal MaxConns to prevent connection churn - when idle connections
 	// exceed this limit, they are closed immediately and must be recreated
-	// on the next request, causing unnecessary overhead.
-	DefaultMaxIdleConns = 20
+	// on the next request, causing unnecessary overhead and rate limit pressure.
+	DefaultMaxIdleConns = 100
 )
 
 const (
@@ -113,7 +118,9 @@ func createConnection(
 		db.SetConnMaxLifetime(DefaultMaxConnLifetime)
 	}
 
-	// Always set idle time for DSQL to free up serverless resources
+	// Set idle time - 0 means connections never expire due to idle time.
+	// This is critical for DSQL: pool must stay at max size to avoid
+	// connection creation under load (100 conn/sec cluster-wide rate limit).
 	db.SetConnMaxIdleTime(DefaultMaxConnIdleTime)
 
 	// Maps struct names in CamelCase to snake without need for db struct tags.

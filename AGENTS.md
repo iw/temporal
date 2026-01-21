@@ -118,9 +118,10 @@
 
 #### Documentation
 - ✅ Updated operator documentation with DSQL setup instructions
-- ✅ Created comprehensive migration guide (`docs/dsql-migration-guide.md`)
-- ✅ Documented DSQL-specific implementation details
-- ✅ Created implementation summary (`docs/dsql-implementation-summary.md`)
+- ✅ Created comprehensive migration guide (`docs/dsql/migration-guide.md`)
+- ✅ Documented DSQL-specific implementation details (`docs/dsql/implementation.md`)
+- ✅ Created DSQL metrics documentation (`docs/dsql/metrics.md`)
+- ✅ Created DSQL overview (`docs/dsql/overview.md`)
 - ✅ Updated all DSQL documentation for accuracy and consistency
 
 #### Observability
@@ -129,6 +130,10 @@
   - Retry attempt counters and success rates
   - Transaction latency and throughput metrics
   - Connection pool utilization monitoring
+- ✅ **Connection closure metrics** (2026-01-21)
+  - `dsql_db_closed_max_lifetime_total` - Tracks MaxConnLifetime closures
+  - `dsql_db_closed_max_idle_time_total` - Tracks MaxConnIdleTime closures (should be 0)
+  - `dsql_db_closed_max_idle_total` - Tracks MaxIdleConns closures
 - ⏳ Create dashboards for DSQL health monitoring
 - ⏳ Define alerts for DSQL connection issues and serialization conflicts
 
@@ -141,7 +146,10 @@
 
 1. **ID Generation Performance**: Need to benchmark Snowflake vs Random ID generation under production load
 2. **✅ Serialization Conflict Handling**: **COMPLETED** - Implemented comprehensive retry strategy with exponential backoff
-3. **Connection Pooling**: Validate connection pool settings for DSQL's serverless architecture
+3. **✅ Connection Pooling**: **COMPLETED** - Pool pre-warming with MaxConnIdleTime=0 ensures stable pool size
+   - Pool defaults: MaxConns=100, MaxIdleConns=100, MaxConnLifetime=55m, MaxConnIdleTime=0
+   - Pre-warming creates all connections at startup (sequential, rate-limited)
+   - Connection closure metrics for monitoring pool health
 4. **Multi-Region Support**: Plan for DSQL's multi-region capabilities (future enhancement)
 5. **Transaction Size Limits**: Verify DSQL transaction size limits align with Temporal's requirements
 6. **Index Performance**: Validate async index creation performance and monitoring
@@ -161,6 +169,12 @@
      - `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE=<table-name>` - DynamoDB table
      - `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT=100` - Cluster-wide limit (default: 100)
    - **Important**: Only applies to NEW connection establishment, not queries
+9. **✅ Connection Pool Pre-Warming**: **IMPLEMENTED** (2026-01-21)
+   - Pool warms to 100 connections at startup (sequential, rate-limited)
+   - `MaxConnIdleTime=0` prevents pool decay - connections stay open indefinitely
+   - `MaxConnLifetime=55m` ensures connections refresh before DSQL's 60m limit
+   - Connection closure metrics track pool health (`dsql_db_closed_max_lifetime_total`, etc.)
+   - See `docs/dsql/implementation.md` for details
 
 ### Known Constraints
 
@@ -169,6 +183,7 @@
 3. **Complex DEFAULT Values Not Supported**: Application must set defaults (✅ implemented)
 4. **Foreign Key Constraints Not Enforced**: JOINs work but referential integrity is application-managed
 5. **✅ Optimistic Concurrency Control**: **ADDRESSED** - Comprehensive retry logic implemented for DSQL's OCC model
+6. **✅ Connection Pool Stability**: **ADDRESSED** - Pool pre-warming and MaxConnIdleTime=0 prevent pool decay
 
 ### Next Agent Actions
 
@@ -232,6 +247,27 @@ The Aurora DSQL persistence layer implementation is now production-ready:
   - `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE=<table-name>` - DynamoDB table name
   - `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT=100` - Cluster-wide limit per second
   - `DSQL_DISTRIBUTED_RATE_LIMITER_MAX_WAIT=30s` - Max wait time for permit
+
+**🔥 Connection Pool Pre-Warming (2026-01-21):**
+- **Purpose**: Eliminate connection creation under load by pre-warming pool at startup
+- **Pool Defaults** (in `session/session.go`):
+  - `MaxConns = 100` - Maximum open connections per pool
+  - `MaxIdleConns = 100` - **MUST equal MaxConns** to prevent idle closure
+  - `MaxConnLifetime = 55m` - Under DSQL's 60 minute limit
+  - `MaxConnIdleTime = 0` - **CRITICAL: Disabled to prevent pool decay**
+- **Files Added**:
+  - `common/persistence/sql/sqlplugin/dsql/pool_warmup.go` - Sequential warmup with retry logic
+- **Files Modified**:
+  - `common/persistence/sql/sqlplugin/dsql/session/session.go` - Updated defaults
+  - `common/persistence/sql/sqlplugin/dsql/metrics.go` - Added closure metrics
+  - `common/persistence/sql/sqlplugin/dsql/plugin.go` - Warmup integration
+- **New Metrics**:
+  - `dsql_db_closed_max_lifetime_total` - Connections closed due to MaxConnLifetime
+  - `dsql_db_closed_max_idle_time_total` - Connections closed due to MaxConnIdleTime (should be 0)
+  - `dsql_db_closed_max_idle_total` - Connections closed due to MaxIdleConns exceeded
+- **Startup Logs**:
+  - `"Starting DSQL pool warmup"` with `target_connections=100`
+  - `"DSQL pool warmup complete"` with `connections_created=99`, `connections_failed=0`
 
 **🔐 Security Recommendations for Production:**
 - **Use AWS Secrets Manager** for database credentials instead of local files

@@ -317,6 +317,8 @@ func (p *plugin) createConnectionWithTokenRefresh(
 		db.SetConnMaxLifetime(session.DefaultMaxConnLifetime)
 	}
 
+	// Set idle time - 0 means connections never expire due to idle time.
+	// This is critical for DSQL: pool must stay at max size always.
 	db.SetConnMaxIdleTime(session.DefaultMaxConnIdleTime)
 
 	// Maps struct names in CamelCase to snake without need for db struct tags.
@@ -326,6 +328,23 @@ func (p *plugin) createConnectionWithTokenRefresh(
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping DSQL: %w", err)
+	}
+
+	// Log pool configuration for debugging
+	logger.Info("DSQL connection pool configured",
+		tag.NewInt("max_open_conns", db.Stats().MaxOpenConnections),
+		tag.NewInt("current_open", db.Stats().OpenConnections),
+		tag.NewDurationTag("max_conn_lifetime", session.DefaultMaxConnLifetime),
+		tag.NewDurationTag("max_conn_idle_time", session.DefaultMaxConnIdleTime))
+
+	// Pre-warm the connection pool to avoid cold-start latency under load.
+	// Run synchronously to ensure warmup completes before returning the connection.
+	// This adds startup time but ensures the pool is ready for immediate use.
+	logger.Info("Starting DSQL connection pool warmup")
+	warmupCfg := DefaultPoolWarmupConfig()
+	if err := WarmupPool(context.Background(), db.DB, warmupCfg, logger); err != nil {
+		logger.Warn("DSQL pool warmup failed", tag.Error(err))
+		// Don't fail - warmup is best-effort
 	}
 
 	return db, nil

@@ -25,6 +25,18 @@ type TxRetryPolicy interface {
 	RetryableTxError(err error) bool
 }
 
+// TxRetryMetrics is an optional interface that TxRetryPolicy implementations can
+// implement to receive callbacks for metrics recording. This allows plugins like
+// DSQL to record retry metrics without modifying the core retry loop.
+type TxRetryMetrics interface {
+	// OnRetry is called when a retry attempt is about to be made
+	OnRetry(operation string, attempt int, err error, backoff time.Duration)
+	// OnExhausted is called when all retry attempts have been exhausted
+	OnExhausted(operation string, attempts int, err error)
+	// OnSuccess is called when the operation succeeds (with attempt count)
+	OnSuccess(operation string, attempts int)
+}
+
 type TxRetryPolicyProvider interface {
 	TxRetryPolicy() TxRetryPolicy
 }
@@ -106,11 +118,18 @@ func (m *SqlStore) txExecute(ctx context.Context, operation string, f func(tx sq
 		return m.txExecuteOnce(ctx, operation, f)
 	}
 
+	// Check if policy supports metrics callbacks
+	metricsPolicy, hasMetrics := m.txRetryPolicy.(TxRetryMetrics)
+
 	maxRetries := m.txRetryPolicy.MaxRetries()
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		err := m.txExecuteOnce(ctx, operation, f)
 		if err == nil {
+			// Record success with attempt count (attempt is 0-indexed, so +1 for human-readable count)
+			if hasMetrics {
+				metricsPolicy.OnSuccess(operation, attempt+1)
+			}
 			return nil
 		}
 		lastErr = err
@@ -122,10 +141,20 @@ func (m *SqlStore) txExecute(ctx context.Context, operation string, f func(tx sq
 
 		// Only retry when policy says it's retryable.
 		if !m.txRetryPolicy.RetryableTxError(err) || attempt == maxRetries {
+			// Record exhausted if we hit max retries on a retryable error
+			if hasMetrics && m.txRetryPolicy.RetryableTxError(err) && attempt == maxRetries {
+				metricsPolicy.OnExhausted(operation, attempt+1, err)
+			}
 			return err
 		}
 
 		delay := m.txRetryPolicy.Backoff(attempt)
+
+		// Record retry attempt
+		if hasMetrics {
+			metricsPolicy.OnRetry(operation, attempt+1, err, delay)
+		}
+
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():

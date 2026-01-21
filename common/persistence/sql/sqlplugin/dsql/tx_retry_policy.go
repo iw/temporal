@@ -11,15 +11,18 @@ import (
 )
 
 // dsqlTxRetryPolicy enables SqlStore txExecute retry for DSQL only.
+// It also records DSQL-specific metrics for transaction retries.
 type dsqlTxRetryPolicy struct {
 	maxRetries   int
 	baseDelay    time.Duration
 	maxDelay     time.Duration
 	jitterFactor float64
 	rng          *rand.Rand
+	metrics      DSQLMetrics
 }
 
 var _ persistsql.TxRetryPolicy = (*dsqlTxRetryPolicy)(nil)
+var _ persistsql.TxRetryMetrics = (*dsqlTxRetryPolicy)(nil)
 
 func NewDSQLTxRetryPolicy(rm *RetryManager) persistsql.TxRetryPolicy {
 	cfg := rm.config.validate()
@@ -29,7 +32,38 @@ func NewDSQLTxRetryPolicy(rm *RetryManager) persistsql.TxRetryPolicy {
 		maxDelay:     cfg.MaxDelay,
 		jitterFactor: cfg.JitterFactor,
 		rng:          rand.New(rand.NewSource(time.Now().UnixNano())),
+		metrics:      rm.metrics,
 	}
+}
+
+// TxRetryMetrics implementation
+
+// OnRetry is called when a retry attempt is about to be made
+func (p *dsqlTxRetryPolicy) OnRetry(operation string, attempt int, err error, backoff time.Duration) {
+	if p.metrics == nil {
+		return
+	}
+	p.metrics.IncTxConflict(operation)
+	p.metrics.IncTxRetry(operation, attempt)
+	p.metrics.ObserveTxBackoff(operation, backoff)
+
+	// Also record error class
+	cls := classifyError(err)
+	p.metrics.IncTxErrorClass(operation, cls.String())
+}
+
+// OnExhausted is called when all retry attempts have been exhausted
+func (p *dsqlTxRetryPolicy) OnExhausted(operation string, attempts int, err error) {
+	if p.metrics == nil {
+		return
+	}
+	p.metrics.IncTxExhausted(operation)
+}
+
+// OnSuccess is called when the operation succeeds
+func (p *dsqlTxRetryPolicy) OnSuccess(operation string, attempts int) {
+	// Currently we don't record success metrics, but this hook is available
+	// for future use (e.g., recording latency histograms by attempt count)
 }
 
 func (p *dsqlTxRetryPolicy) MaxRetries() int {

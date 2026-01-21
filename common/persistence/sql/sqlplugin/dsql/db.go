@@ -15,6 +15,7 @@ import (
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/schema"
 	persistsql "go.temporal.io/server/common/persistence/sql"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
@@ -266,6 +267,13 @@ func (pdb *db) QueryRowContext(ctx context.Context, query string, args ...any) *
 
 func (pdb *db) Rebind(query string) string {
 	return pdb.conn().Rebind(query)
+}
+
+// NewExecutionStore implements sql.ExecutionStoreCreator interface.
+// This allows DSQL to wrap the common execution store with DSQL-specific optimizations,
+// particularly batching reads in GetWorkflowExecution into a single transaction.
+func (pdb *db) NewExecutionStore(baseStore persistence.ExecutionStore, logger log.Logger) persistence.ExecutionStore {
+	return NewDSQLExecutionStore(baseStore, pdb, logger)
 }
 
 // GetRetryManager returns the retry manager for DSQL operations

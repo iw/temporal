@@ -245,9 +245,9 @@ func TestDSQLPoolDefaults(t *testing.T) {
 	// so MaxConnLifetime doesn't need to be shorter than token duration.
 	// It just needs to be under DSQL's 60 minute connection limit.
 	require.Equal(t, 55*time.Minute, DefaultMaxConnLifetime, "MaxConnLifetime should be 55 minutes (under DSQL's 60 min limit)")
-	require.Equal(t, 5*time.Minute, DefaultMaxConnIdleTime, "MaxConnIdleTime should be 5 minutes")
-	require.Equal(t, 20, DefaultMaxConns, "DefaultMaxConns should be 20")
-	require.Equal(t, 20, DefaultMaxIdleConns, "DefaultMaxIdleConns should be 20 (matches MaxConns to avoid connection churn)")
+	require.Equal(t, time.Duration(0), DefaultMaxConnIdleTime, "MaxConnIdleTime should be 0 (disabled to prevent pool decay)")
+	require.Equal(t, 100, DefaultMaxConns, "DefaultMaxConns should be 100 (for high-throughput workloads)")
+	require.Equal(t, 100, DefaultMaxIdleConns, "DefaultMaxIdleConns should be 100 (MUST equal MaxConns to prevent pool decay)")
 }
 
 func TestDSQLPoolDefaults_UnderDSQLLimits(t *testing.T) {
