@@ -594,6 +594,118 @@ func (m *dsqlMetricsImpl) StartPoolCollector(db *sql.DB, interval time.Duration)
 }
 ```
 
+## Connection Pool Pre-Warming
+
+DSQL has a cluster-wide connection rate limit of 100 connections/second. To avoid connection creation under load, the pool is pre-warmed at startup to its maximum size.
+
+### Why Pre-Warming is Critical
+
+1. **Rate Limit Pressure**: If the pool starts empty and grows on-demand, multiple services competing for connections can exhaust the 100/sec budget
+2. **Cold-Start Latency**: First requests would wait for connection establishment (TCP + TLS + IAM auth)
+3. **Cascade Failures**: Under load, connection timeouts can cascade as services retry
+
+### Pool Configuration
+
+```go
+const (
+    // Pool MUST stay at max size to avoid connection creation under load
+    DefaultMaxConns     = 100
+    DefaultMaxIdleConns = 100  // MUST equal MaxConns
+    
+    // CRITICAL: Must be 0 to prevent pool decay
+    // Go's database/sql closes idle connections after this timeout
+    DefaultMaxConnIdleTime = 0
+    
+    // 55 minutes, safely under DSQL's 60 minute limit
+    DefaultMaxConnLifetime = 55 * time.Minute
+)
+```
+
+### Warmup Implementation (`pool_warmup.go`)
+
+```go
+type PoolWarmupConfig struct {
+    TargetConnections int           // Default: matches MaxConns (100)
+    MaxRetries        int           // Default: 5
+    RetryBackoff      time.Duration // Default: 200ms (with jitter)
+    MaxBackoff        time.Duration // Default: 5s
+    ConnectionTimeout time.Duration // Default: 10s per connection
+}
+
+func WarmupPool(ctx context.Context, db *sql.DB, cfg PoolWarmupConfig, 
+    logger log.Logger) error {
+    
+    current := db.Stats().OpenConnections
+    toCreate := cfg.TargetConnections - current
+    
+    logger.Info("Starting DSQL pool warmup",
+        tag.NewInt("current_connections", current),
+        tag.NewInt("target_connections", cfg.TargetConnections),
+        tag.NewInt("connections_to_create", toCreate))
+    
+    var created, failed int
+    for i := 0; i < toCreate; i++ {
+        err := createOneConnection(ctx, db, cfg)
+        if err != nil {
+            failed++
+            logger.Warn("Pool warmup connection failed", tag.Error(err))
+        } else {
+            created++
+        }
+    }
+    
+    logger.Info("DSQL pool warmup complete",
+        tag.NewInt("connections_created", created),
+        tag.NewInt("connections_failed", failed),
+        tag.NewInt("final_open_connections", db.Stats().OpenConnections))
+    
+    return nil
+}
+
+func createOneConnection(ctx context.Context, db *sql.DB, cfg PoolWarmupConfig) error {
+    // Each connection has its own timeout and retry logic
+    for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+        connCtx, cancel := context.WithTimeout(ctx, cfg.ConnectionTimeout)
+        conn, err := db.Conn(connCtx)
+        cancel()
+        
+        if err == nil {
+            // Ping to ensure connection is valid, then return to pool
+            err = conn.PingContext(ctx)
+            conn.Close() // Returns to pool, doesn't close
+            if err == nil {
+                return nil
+            }
+        }
+        
+        if attempt < cfg.MaxRetries {
+            backoff := calculateBackoffWithJitter(cfg, attempt)
+            time.Sleep(backoff)
+        }
+    }
+    return fmt.Errorf("failed after %d attempts", cfg.MaxRetries)
+}
+```
+
+### Warmup Behavior
+
+- **Sequential creation**: Connections are created one at a time (not in batches) for reliability
+- **Per-connection timeout**: Each connection has a 10-second timeout
+- **Exponential backoff**: Failed connections retry with jitter (50-150%)
+- **Best-effort**: Warmup failures are logged but don't prevent startup
+- **Synchronous**: Warmup completes before the connection is returned to callers
+
+### Startup Logs
+
+On successful warmup, you'll see:
+
+```
+DSQL connection pool configured  max_open_conns=100 current_open=1 max_conn_lifetime=55m0s max_conn_idle_time=0s
+Starting DSQL connection pool warmup
+Starting DSQL pool warmup  current_connections=1 target_connections=100 connections_to_create=99
+DSQL pool warmup complete  connections_created=99 connections_failed=0 final_open_connections=100
+```
+
 ## Testing
 
 ```bash

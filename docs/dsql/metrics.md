@@ -38,6 +38,23 @@ The `error_class` label can have these values:
 | `dsql_pool_wait_total` | Counter | Times a connection was waited for |
 | `dsql_pool_wait_duration` | Timer | Total time spent waiting for connections |
 
+### Connection Closure Metrics
+
+These metrics track WHY connections are being closed, helping diagnose pool decay:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dsql_db_closed_max_lifetime_total` | Gauge | Connections closed due to `MaxConnLifetime` (expected after 55 min) |
+| `dsql_db_closed_max_idle_time_total` | Gauge | Connections closed due to `MaxConnIdleTime` (should be 0 if configured correctly) |
+| `dsql_db_closed_max_idle_total` | Gauge | Connections closed because idle pool was full (shouldn't happen if `MaxIdleConns = MaxConns`) |
+
+**Interpreting closure metrics:**
+
+- **`dsql_db_closed_max_lifetime_total` increasing**: Normal - connections are being rotated after 55 minutes
+- **`dsql_db_closed_max_idle_time_total` increasing**: Problem - `MaxConnIdleTime` should be 0 to prevent pool decay
+- **`dsql_db_closed_max_idle_total` increasing**: Problem - `MaxIdleConns` should equal `MaxConns`
+- **Pool shrinking but closure counters flat**: Server/network is closing connections (check DSQL logs, network issues)
+
 Pool metrics are sampled every 15 seconds by a background collector.
 
 ## Derived Metrics
@@ -164,6 +181,11 @@ dsql_pool_max_open
 
 # Connection churn
 rate(dsql_pool_wait_total[5m])
+
+# Connection closures by reason (helps diagnose pool decay)
+dsql_db_closed_max_lifetime_total   # Expected: increases every 55 min
+dsql_db_closed_max_idle_time_total  # Should be 0 if MaxConnIdleTime=0
+dsql_db_closed_max_idle_total       # Should be 0 if MaxIdleConns=MaxConns
 ```
 
 ### OCC Performance

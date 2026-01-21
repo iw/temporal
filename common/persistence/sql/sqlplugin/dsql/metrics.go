@@ -60,6 +60,11 @@ type dsqlMetricsImpl struct {
 	poolWaitCount    metrics.CounterIface
 	poolWaitDuration metrics.TimerIface
 
+	// Connection closure metrics (cumulative counters from db.Stats())
+	poolClosedMaxLifetime metrics.GaugeIface
+	poolClosedMaxIdleTime metrics.GaugeIface
+	poolClosedMaxIdle     metrics.GaugeIface
+
 	// Legacy metrics for backward compatibility
 	retryCounter              metrics.CounterIface
 	conflictCounter           metrics.CounterIface
@@ -99,6 +104,11 @@ func NewDSQLMetrics(metricsHandler metrics.Handler) DSQLMetrics {
 		poolIdle:         metricsHandler.Gauge("dsql_pool_idle"),
 		poolWaitCount:    metricsHandler.Counter("dsql_pool_wait_total"),
 		poolWaitDuration: metricsHandler.Timer("dsql_pool_wait_duration"),
+
+		// Connection closure metrics - cumulative counters showing WHY connections closed
+		poolClosedMaxLifetime: metricsHandler.Gauge("dsql_db_closed_max_lifetime_total"),
+		poolClosedMaxIdleTime: metricsHandler.Gauge("dsql_db_closed_max_idle_time_total"),
+		poolClosedMaxIdle:     metricsHandler.Gauge("dsql_db_closed_max_idle_total"),
 
 		// Legacy metrics for backward compatibility
 		retryCounter:              metricsHandler.Counter("dsql_tx_retries_total"),
@@ -206,7 +216,7 @@ func (m *dsqlMetricsImpl) runPoolCollector(ctx context.Context, db *sql.DB, inte
 func (m *dsqlMetricsImpl) recordPoolStats(db *sql.DB) {
 	stats := db.Stats()
 
-	// Record gauge metrics
+	// Record gauge metrics for current pool state
 	m.poolMaxOpen.Record(float64(stats.MaxOpenConnections))
 	m.poolOpen.Record(float64(stats.OpenConnections))
 	m.poolInUse.Record(float64(stats.InUse))
@@ -221,10 +231,18 @@ func (m *dsqlMetricsImpl) recordPoolStats(db *sql.DB) {
 	m.lastWaitCount = stats.WaitCount
 
 	// Record wait duration (cumulative, but we record the current total)
-	// This gives us the total time spent waiting for connections
 	if stats.WaitDuration > 0 {
 		m.poolWaitDuration.Record(stats.WaitDuration)
 	}
+
+	// Record connection closure counters (cumulative totals)
+	// These tell us WHY connections are being closed:
+	// - MaxLifetimeClosed: closed due to MaxConnLifetime (expected after 55 min)
+	// - MaxIdleTimeClosed: closed due to MaxConnIdleTime (should be 0 if set to 0)
+	// - MaxIdleClosed: closed because idle pool was full (shouldn't happen if MaxIdleConns = MaxConns)
+	m.poolClosedMaxLifetime.Record(float64(stats.MaxLifetimeClosed))
+	m.poolClosedMaxIdleTime.Record(float64(stats.MaxIdleTimeClosed))
+	m.poolClosedMaxIdle.Record(float64(stats.MaxIdleClosed))
 }
 
 // Legacy methods for backward compatibility
