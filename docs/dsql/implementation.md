@@ -25,6 +25,9 @@ This document covers the technical implementation of Aurora DSQL support in Temp
   - [Token Cache](#token-cache-tokencachego)
 - [Connection Rate Limiting](#connection-rate-limiting)
 - [Pool Metrics Collection](#pool-metrics-collection)
+- [Connection Pool Pre-Warming](#connection-pool-pre-warming)
+- [Pool Keeper](#pool-keeper)
+- [Pool Simulator](#pool-simulator)
 - [Testing](#testing)
 
 ## Code Structure
@@ -44,12 +47,32 @@ common/persistence/sql/sqlplugin/dsql/
 ├── token_cache.go                 # IAM token caching
 ├── connection_rate_limiter.go     # Local (per-instance) rate limiting
 ├── distributed_rate_limiter.go    # DynamoDB-backed distributed rate limiting
+├── pool_warmup.go                 # Connection pool pre-warming at startup
+├── pool_keeper.go                 # Background pool maintenance
 ├── uuid.go                        # UUID string conversion utilities
 ├── typeconv.go                    # DateTime conversion
 ├── driver/
-│   └── token_refreshing.go        # Token-refreshing database driver
+│   ├── token_refreshing.go        # Token-refreshing database driver
+│   └── connection_registry.go     # Connection tracking for lifecycle management
 └── session/
     └── session.go                 # Connection session management
+
+tools/poolsim/                     # Discrete event simulator for pool behavior
+├── main.go                        # Entry point and simulation runner
+├── config.go                      # Configuration loading and defaults
+├── pool.go                        # Connection pool model
+├── warmup.go                      # Pool warmup simulation
+├── keeper.go                      # Pool keeper simulation
+├── workload.go                    # Database workload simulation
+├── limiter.go                     # Rate limiter model
+├── metrics.go                     # Metrics collection
+├── assertions.go                  # Validation assertions
+├── sim.go                         # Discrete event simulation engine
+├── README.md                      # Documentation
+└── scenarios/                     # Pre-configured test scenarios
+    ├── local.yaml                 # Local development (200 connections)
+    ├── ecs-150wps.yaml            # ECS 150 WPS (2,000 connections)
+    └── ecs-400wps.yaml            # ECS 400 WPS (22,000 connections)
 
 schema/dsql/v12/temporal/
 └── schema.sql                     # DSQL-compatible schema
@@ -705,6 +728,108 @@ Starting DSQL connection pool warmup
 Starting DSQL pool warmup  current_connections=1 target_connections=100 connections_to_create=99
 DSQL pool warmup complete  connections_created=99 connections_failed=0 final_open_connections=100
 ```
+
+## Pool Keeper
+
+After warmup, the Pool Keeper maintains pool size by replacing connections closed by `MaxConnLifetime`.
+
+### Why Pool Keeper is Needed
+
+Go's `database/sql` closes connections after `MaxConnLifetime` (55 minutes). Without active maintenance, the pool would gradually shrink as connections age out. The Pool Keeper detects deficits and creates replacement connections.
+
+### Ratio-Based Batching
+
+The Pool Keeper uses ratio-based batching to handle peak expiry rates:
+
+```go
+// MaxConnsPerTick = ceil(poolSize / staggerSeconds), capped at 10
+// Examples:
+//   - 50 connections:  ceil(50/120)  = 1 per tick
+//   - 100 connections: ceil(100/120) = 1 per tick  
+//   - 500 connections: ceil(500/120) = 5 per tick
+//   - 1000+ connections: capped at 10 per tick
+```
+
+**Important**: `MaxConnsPerTick` is a LOCAL desire, not a guarantee. The global rate limiter (100 conn/sec cluster-wide) is the HARD constraint. When multiple pools compete for the rate limit budget, they back off and retry.
+
+### Implementation (`pool_keeper.go`)
+
+```go
+type PoolKeeperConfig struct {
+    TargetPoolSize    int           // Desired pool size
+    TickInterval      time.Duration // Default: 1 second
+    MaxConnsPerTick   int           // Calculated from pool size
+    ConnectionTimeout time.Duration // Default: 10 seconds
+}
+
+func (pk *PoolKeeper) tick(ctx context.Context) {
+    stats := pk.db.Stats()
+    deficit := pk.cfg.TargetPoolSize - stats.OpenConnections
+    
+    if deficit <= 0 {
+        return // Pool is at or above target
+    }
+    
+    // Create at most MaxConnsPerTick connections this tick
+    toCreate := min(deficit, pk.cfg.MaxConnsPerTick)
+    
+    for i := 0; i < toCreate; i++ {
+        pk.createOneConnection(ctx)
+    }
+}
+```
+
+### Startup Logs
+
+```
+DSQL pool keeper started  target_pool_size=100 tick_interval=1s max_conns_per_tick=1
+```
+
+## Pool Simulator
+
+A discrete event simulator is available for validating pool behavior under various conditions without requiring a real DSQL cluster.
+
+### Running the Simulator
+
+```bash
+# Run with default config (local development)
+go run ./tools/poolsim
+
+# Run with ECS 150 WPS scenario
+go run ./tools/poolsim -config tools/poolsim/scenarios/ecs-150wps.yaml
+
+# Output to CSV for analysis
+go run ./tools/poolsim -config tools/poolsim/scenarios/local.yaml -out results.csv
+```
+
+### What It Models
+
+- **Pool Warmup**: Staggered connection creation at startup
+- **Pool Keeper**: Edge-triggered maintenance with ratio-based batching
+- **MaxConnLifetime**: Go's `database/sql` closes connections after this duration
+- **Rate Limiting**: DSQL's cluster-wide 100 connections/second limit
+- **Workload Simulation**: Database queries consuming connections
+
+### Assertions
+
+The simulator validates behavior with configurable assertions:
+
+| Assertion | Description |
+|-----------|-------------|
+| `assertMaxConnectsPerSec` | Global connection rate must not exceed 100/sec |
+| `assertConvergeWithin` | All pools must reach target within this duration |
+| `assertStableFor` | After reaching target, pools must stay stable |
+| `assertMaxClosurePerSec` | Detects thundering herd by limiting closure rate |
+
+### Pre-Configured Scenarios
+
+| Scenario | Pools | Connections | Use Case |
+|----------|-------|-------------|----------|
+| `local.yaml` | 4 | 200 | Local development |
+| `ecs-150wps.yaml` | 20 | 2,000 | ECS 150 WPS deployment |
+| `ecs-400wps.yaml` | 44 | 22,000 | ECS 400 WPS deployment |
+
+See `tools/poolsim/README.md` for full documentation.
 
 ## Testing
 

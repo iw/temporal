@@ -18,7 +18,8 @@ type PoolWarmupConfig struct {
 	Enabled bool
 
 	// TargetConnections is the number of connections to pre-warm.
-	// If 0, defaults to session.DefaultMaxConns (50).
+	// If 0, defaults to session.DefaultMaxConns (100).
+	// Note: plugin.go overrides this with the actual configured pool size.
 	TargetConnections int
 
 	// MaxRetries is the maximum number of retry attempts per connection.
@@ -37,18 +38,96 @@ type PoolWarmupConfig struct {
 	// ConnectionTimeout is the timeout for each individual connection attempt.
 	// Default: 10 seconds
 	ConnectionTimeout time.Duration
+
+	// StaggerDuration is the total time window over which to spread connection creation.
+	// Connections are created with delays spread across this window to ensure they
+	// hit MaxConnLifetime at different times, avoiding thundering herd on expiry.
+	//
+	// For large pools, this is calculated based on the DSQL cluster rate limit (100/sec)
+	// to ensure warmup doesn't exceed the rate limit.
+	//
+	// Default: calculated based on pool size
+	//   - Small pools (≤100): 0 (no stagger, fast warmup)
+	//   - Medium pools (101-500): 2 minutes
+	//   - Large pools (500+): scaled to respect rate limit with 50% headroom
+	//
+	// Set to 0 to disable staggering (all connections created immediately).
+	StaggerDuration time.Duration
 }
 
+// Environment variable names for pool warmup configuration
+const (
+	PoolWarmupStaggerDurationEnvVar = "DSQL_POOL_WARMUP_STAGGER_DURATION"
+)
+
+// ClusterRateLimitForWarmup is the portion of cluster rate limit to use during warmup.
+// We use 50% to leave headroom for other services warming up simultaneously.
+const ClusterRateLimitForWarmup = 50 // connections per second (50% of 100)
+
 // DefaultPoolWarmupConfig returns the default pool warmup configuration.
+// For large pools, stagger duration is calculated to respect DSQL rate limits.
 func DefaultPoolWarmupConfig() PoolWarmupConfig {
 	return PoolWarmupConfig{
 		Enabled:           true,
-		TargetConnections: session.DefaultMaxConns, // 50
+		TargetConnections: session.DefaultMaxConns, // 100 (overridden by plugin.go)
 		MaxRetries:        5,
 		RetryBackoff:      200 * time.Millisecond,
 		MaxBackoff:        5 * time.Second,
 		ConnectionTimeout: 10 * time.Second,
+		StaggerDuration:   0, // Calculated in CalculateStaggerDuration based on pool size
 	}
+}
+
+// CalculateStaggerDuration returns the appropriate stagger duration for a pool size.
+// This ensures connections are spread out to avoid thundering herd on expiry,
+// while respecting the DSQL cluster-wide rate limit during warmup.
+func CalculateStaggerDuration(poolSize int) time.Duration {
+	// Allow env override for tuning
+	if envStagger := getEnvDuration(PoolWarmupStaggerDurationEnvVar, 0); envStagger > 0 {
+		return envStagger
+	}
+
+	// Small pools: no stagger needed, fast warmup
+	if poolSize <= 100 {
+		return 0
+	}
+
+	// Medium pools: 2 minutes is sufficient
+	if poolSize <= 500 {
+		return 2 * time.Minute
+	}
+
+	// Large pools: calculate based on rate limit
+	// We want warmup to complete within rate limit, with 50% headroom for other services
+	//
+	// Example: 8000 connections at 50/sec = 160 seconds = 2.67 minutes
+	// Round up to nearest minute for cleaner numbers
+	minSeconds := poolSize / ClusterRateLimitForWarmup
+	minDuration := time.Duration(minSeconds) * time.Second
+
+	// Round up to nearest minute, minimum 3 minutes for large pools
+	minutes := (int(minDuration.Minutes()) + 1)
+	if minutes < 3 {
+		minutes = 3
+	}
+
+	return time.Duration(minutes) * time.Minute
+}
+
+// WarmupResult contains the result of pool warmup including connections for tracking.
+type WarmupResult struct {
+	// Connections holds the warmed connections.
+	// The caller should close these to return them to the pool.
+	Connections []*sql.Conn
+
+	// SuccessCount is the number of connections successfully created.
+	SuccessCount int
+
+	// FailedCount is the number of connections that failed to create.
+	FailedCount int
+
+	// TotalRetries is the total number of retry attempts across all connections.
+	TotalRetries int
 }
 
 // WarmupPool pre-warms the connection pool by establishing connections up front.
@@ -57,16 +136,19 @@ func DefaultPoolWarmupConfig() PoolWarmupConfig {
 // The warmup process:
 // 1. Acquires connections up to the target count, holding them all open
 // 2. Executes a simple query on each to ensure they're fully established
-// 3. Releases all connections back to the pool at once
+// 3. Returns the connections for lifecycle tracking (caller must close them)
 //
 // By holding all connections open during warmup, we ensure they stay in the pool
 // rather than being closed by Go's database/sql idle connection management.
-func WarmupPool(ctx context.Context, db *sql.DB, cfg PoolWarmupConfig, logger log.Logger) error {
+//
+// The returned WarmupResult.Connections should be closed by the caller
+// to return them to the pool.
+func WarmupPool(ctx context.Context, db *sql.DB, cfg PoolWarmupConfig, logger log.Logger) (*WarmupResult, error) {
 	if !cfg.Enabled {
 		if logger != nil {
 			logger.Info("DSQL pool warmup disabled")
 		}
-		return nil
+		return &WarmupResult{}, nil
 	}
 
 	// Determine target connections
@@ -90,7 +172,7 @@ func WarmupPool(ctx context.Context, db *sql.DB, cfg PoolWarmupConfig, logger lo
 				tag.NewInt("current_connections", currentOpen),
 				tag.NewInt("target_connections", targetConns))
 		}
-		return nil
+		return &WarmupResult{}, nil
 	}
 
 	if logger != nil {
@@ -98,28 +180,40 @@ func WarmupPool(ctx context.Context, db *sql.DB, cfg PoolWarmupConfig, logger lo
 			tag.NewInt("current_connections", currentOpen),
 			tag.NewInt("target_connections", targetConns),
 			tag.NewInt("connections_to_create", needed),
-			tag.NewInt("max_retries", cfg.MaxRetries))
+			tag.NewInt("max_retries", cfg.MaxRetries),
+			tag.NewDurationTag("stagger_duration", cfg.StaggerDuration))
 	}
 
 	startTime := time.Now()
 
 	// Hold all connections open during warmup to prevent them from being closed
 	connections := make([]*sql.Conn, 0, needed)
-	defer func() {
-		// Release all connections back to the pool
-		for _, conn := range connections {
-			conn.Close()
-		}
-	}()
 
 	successCount := 0
 	totalRetries := 0
 
-	// Create connections sequentially with retries, holding each one open
+	// Calculate delay between connections to spread them across StaggerDuration.
+	// This ensures connections hit MaxConnLifetime at different times.
+	var delayBetweenConns time.Duration
+	if cfg.StaggerDuration > 0 && needed > 1 {
+		delayBetweenConns = cfg.StaggerDuration / time.Duration(needed-1)
+	}
+
+	// Create connections sequentially with staggered delays
 	for i := 0; i < needed; i++ {
 		// Check if parent context is cancelled
 		if ctx.Err() != nil {
 			break
+		}
+
+		// Add staggered delay (except for first connection)
+		if i > 0 && delayBetweenConns > 0 {
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(delayBetweenConns):
+				// Continue to create next connection
+			}
 		}
 
 		conn, retries, success := warmupOneConnectionWithRetry(ctx, db, cfg, logger)
@@ -144,8 +238,13 @@ func WarmupPool(ctx context.Context, db *sql.DB, cfg PoolWarmupConfig, logger lo
 			tag.NewDurationTag("elapsed", elapsed))
 	}
 
-	// Connections are released when the defer runs, returning them to the pool
-	return nil
+	// Return the connections - caller should close them to return to pool
+	return &WarmupResult{
+		Connections:  connections,
+		SuccessCount: successCount,
+		FailedCount:  failed,
+		TotalRetries: totalRetries,
+	}, nil
 }
 
 // warmupOneConnectionWithRetry establishes a single connection with retry logic.
@@ -244,6 +343,8 @@ func warmupOneConnection(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
 // StartPeriodicWarmup starts a background goroutine that periodically warms up the pool.
 // This is useful because idle connections are closed after MaxConnIdleTime.
 // Returns a cancel function to stop the periodic warmup.
+//
+// Note: This function closes warmed connections immediately after creation.
 func StartPeriodicWarmup(
 	ctx context.Context,
 	db *sql.DB,
@@ -254,8 +355,12 @@ func StartPeriodicWarmup(
 	ctx, cancel := context.WithCancel(ctx)
 
 	go func() {
-		// Initial warmup
-		_ = WarmupPool(ctx, db, cfg, logger)
+		// Initial warmup - close connections after warmup
+		if result, err := WarmupPool(ctx, db, cfg, logger); err == nil && result != nil {
+			for _, conn := range result.Connections {
+				conn.Close()
+			}
+		}
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -265,7 +370,11 @@ func StartPeriodicWarmup(
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = WarmupPool(ctx, db, cfg, logger)
+				if result, err := WarmupPool(ctx, db, cfg, logger); err == nil && result != nil {
+					for _, conn := range result.Connections {
+						conn.Close()
+					}
+				}
 			}
 		}
 	}()

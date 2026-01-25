@@ -1,0 +1,63 @@
+# Mass Drop Recovery Test
+#
+# Tests recovery from sudden connection loss (network event, DSQL failover).
+# Uses the local configuration for fast testing.
+#
+# Scenario:
+# - Services start and reach steady state
+# - At 5 minutes, 50% of connections are dropped
+# - Observe recovery time
+
+seed: 42
+endpoint: cluster.dsql.eu-west-1.on.aws
+
+duration: 15m
+sampleEvery: 1s
+
+limiterPerSec: 100
+
+assertMaxConnectsPerSec: 100
+assertConvergeWithin: 60s
+assertMaxClosurePerSec: 200
+
+scenario:
+  kind: mass_drop
+  dropAt: 5m
+  dropFraction: 0.5
+
+services:
+  - name: history
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 0s
+
+  - name: matching
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 100ms
+
+  - name: frontend
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 200ms
+
+  - name: worker
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 300ms
