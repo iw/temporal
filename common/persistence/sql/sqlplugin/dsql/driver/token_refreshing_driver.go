@@ -41,15 +41,27 @@ type LogFunc func(msg string, keysAndValues ...any)
 // connection rate limits (100 connections/sec). This is critical because pool growth
 // happens internally in database/sql and would otherwise bypass any rate limiting
 // applied at the application level.
+//
+// Additionally, the driver tracks all connection birth times in a registry, enabling
+// the connection refresher to know when connections should be replaced.
 type tokenRefreshingDriver struct {
 	underlying    driver.Driver
 	tokenProvider TokenProvider
-	rateLimiter   RateLimiter // Rate limiter for connection establishment
+	rateLimiter   RateLimiter         // Rate limiter for connection establishment
+	registry      *ConnectionRegistry // Tracks connection birth times
 	username      string
 	driverName    string
 	logFunc       LogFunc
 	openCount     atomic.Int64
 	mu            sync.RWMutex
+}
+
+// trackedConn wraps a driver.Conn to track when it's closed.
+type trackedConn struct {
+	driver.Conn
+	id       uint64
+	registry *ConnectionRegistry
+	logFunc  LogFunc
 }
 
 // driverName is the name used to register this driver with database/sql.
@@ -62,22 +74,26 @@ var (
 )
 
 // RegisterTokenRefreshingDriver registers a new token-refreshing driver and returns
-// the driver name to use with sql.Open(). Each call creates a unique driver registration.
+// the driver name to use with sql.Open() and the connection registry.
+// Each call creates a unique driver registration.
 //
 // The username is used when constructing the DSN with fresh tokens.
-func RegisterTokenRefreshingDriver(username string, tokenProvider TokenProvider) (string, error) {
+func RegisterTokenRefreshingDriver(username string, tokenProvider TokenProvider) (string, *ConnectionRegistry, error) {
 	return RegisterTokenRefreshingDriverWithLogger(username, tokenProvider, nil, nil)
 }
 
 // RegisterTokenRefreshingDriverWithLogger registers a new token-refreshing driver with logging
-// and rate limiting support.
+// and rate limiting support. Returns the driver name and the connection registry.
 //
 // The rateLimiter parameter is optional but strongly recommended for DSQL connections.
 // When provided, it ensures ALL connection attempts (including pool growth) respect
 // DSQL's cluster-wide connection rate limits (100 connections/sec).
-func RegisterTokenRefreshingDriverWithLogger(username string, tokenProvider TokenProvider, rateLimiter RateLimiter, logFunc LogFunc) (string, error) {
+//
+// The returned ConnectionRegistry can be used by the connection refresher to track
+// connection ages and trigger replacement of old connections.
+func RegisterTokenRefreshingDriverWithLogger(username string, tokenProvider TokenProvider, rateLimiter RateLimiter, logFunc LogFunc) (string, *ConnectionRegistry, error) {
 	if tokenProvider == nil {
-		return "", fmt.Errorf("tokenProvider cannot be nil")
+		return "", nil, fmt.Errorf("tokenProvider cannot be nil")
 	}
 	if username == "" {
 		username = "admin"
@@ -89,18 +105,22 @@ func RegisterTokenRefreshingDriverWithLogger(username string, tokenProvider Toke
 	driverName := fmt.Sprintf("%s%d", driverNamePrefix, driverCounter)
 	driverMu.Unlock()
 
+	// Create connection registry
+	registry := NewConnectionRegistry()
+
 	// Create and register the wrapper driver
 	wrapper := &tokenRefreshingDriver{
 		underlying:    stdlib.GetDefaultDriver(),
 		tokenProvider: tokenProvider,
 		rateLimiter:   rateLimiter,
+		registry:      registry,
 		username:      username,
 		driverName:    driverName,
 		logFunc:       logFunc,
 	}
 
 	sql.Register(driverName, wrapper)
-	return driverName, nil
+	return driverName, registry, nil
 }
 
 // Open implements driver.Driver. It enforces rate limiting, gets a fresh token,
@@ -173,13 +193,33 @@ func (d *tokenRefreshingDriver) Open(dsn string) (driver.Conn, error) {
 		return nil, err
 	}
 
+	// Register connection in the registry for lifecycle tracking
+	tracked := d.registry.Register(conn)
+
 	if d.logFunc != nil {
 		d.logFunc("Token-refreshing driver connection established with fresh token",
 			"driver_name", d.driverName,
-			"open_count", openNum)
+			"open_count", openNum,
+			"connection_id", tracked.ID)
 	}
 
-	return conn, nil
+	// Wrap the connection to track when it's closed
+	return &trackedConn{
+		Conn:     conn,
+		id:       tracked.ID,
+		registry: d.registry,
+		logFunc:  d.logFunc,
+	}, nil
+}
+
+// Close implements driver.Conn. It unregisters the connection from the registry.
+func (c *trackedConn) Close() error {
+	c.registry.Unregister(c.id)
+	if c.logFunc != nil {
+		c.logFunc("Token-refreshing driver connection closed",
+			"connection_id", c.id)
+	}
+	return c.Conn.Close()
 }
 
 // injectToken creates a new DSN with the provided token as the password.

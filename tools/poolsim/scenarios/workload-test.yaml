@@ -1,0 +1,94 @@
+# Workload Simulation Test
+#
+# Tests pool behavior under simulated database workload.
+# This models Temporal services making database queries.
+#
+# Scenario:
+# - Services start and warm up pools
+# - Workload starts after warmup
+# - Each service maintains ~30 concurrent queries
+# - Queries hold connections for 10-20ms
+
+seed: 42
+endpoint: cluster.dsql.eu-west-1.on.aws
+
+duration: 5m
+sampleEvery: 1s
+
+limiterPerSec: 100
+
+assertMaxConnectsPerSec: 100
+assertConvergeWithin: 10s
+assertMaxClosurePerSec: 50
+
+scenario:
+  kind: cold_start
+
+services:
+  - name: history
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 0s
+    workload:
+      enabled: true
+      maxInUse: 30          # Target 30 concurrent queries
+      holdTime: 10ms        # Each query takes 10-20ms
+      holdJitter: 10ms
+      spawnEvery: 100ms     # Check every 100ms
+      arrivalBurst: 10      # Start up to 10 queries per tick
+      maxWait: 5s
+
+  - name: matching
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 100ms
+    workload:
+      enabled: true
+      maxInUse: 20
+      holdTime: 5ms
+      holdJitter: 5ms
+      spawnEvery: 100ms
+      arrivalBurst: 10
+      maxWait: 5s
+
+  - name: frontend
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 200ms
+    workload:
+      enabled: true
+      maxInUse: 15
+      holdTime: 5ms
+      holdJitter: 5ms
+      spawnEvery: 100ms
+      arrivalBurst: 10
+      maxWait: 5s
+
+  - name: worker
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 300ms
+    workload:
+      enabled: true
+      maxInUse: 10
+      holdTime: 20ms
+      holdJitter: 10ms
+      spawnEvery: 100ms
+      arrivalBurst: 5
+      maxWait: 5s

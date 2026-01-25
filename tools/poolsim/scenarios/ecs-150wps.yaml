@@ -1,0 +1,212 @@
+# ECS 150 WPS Configuration
+#
+# Simulates a production ECS deployment for 150 WPS workloads.
+#
+# Services:
+# - 8 History × 100 connections = 800
+# - 6 Matching × 100 connections = 600
+# - 4 Frontend × 100 connections = 400
+# - 2 Worker × 100 connections = 200
+# Total: 2,000 connections
+#
+# Expected convergence: ~20 seconds (2000 / 100 = 20s)
+
+seed: 42
+endpoint: cluster.dsql.eu-west-1.on.aws
+
+duration: 30m
+sampleEvery: 1s
+
+limiterPerSec: 100
+
+assertMaxConnectsPerSec: 100
+assertConvergeWithin: 60s
+assertMaxClosurePerSec: 100
+
+scenario:
+  kind: cold_start
+
+services:
+  # History (8 replicas)
+  - name: history-1
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 0ms
+
+  - name: history-2
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 50ms
+
+  - name: history-3
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 100ms
+
+  - name: history-4
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 150ms
+
+  - name: history-5
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 200ms
+
+  - name: history-6
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 250ms
+
+  - name: history-7
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 300ms
+
+  - name: history-8
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 350ms
+
+  # Matching (6 replicas)
+  - name: matching-1
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 400ms
+
+  - name: matching-2
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 450ms
+
+  - name: matching-3
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 500ms
+
+  - name: matching-4
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 550ms
+
+  - name: matching-5
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 600ms
+
+  - name: matching-6
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 650ms
+
+  # Frontend (4 replicas)
+  - name: frontend-1
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 700ms
+
+  - name: frontend-2
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 750ms
+
+  - name: frontend-3
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 800ms
+
+  - name: frontend-4
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 850ms
+
+  # Worker (2 replicas)
+  - name: worker-1
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 900ms
+
+  - name: worker-2
+    targetOpen: 100
+    maxOpen: 100
+    maxConnLifetime: 10m
+    warmupStagger: 0s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 950ms

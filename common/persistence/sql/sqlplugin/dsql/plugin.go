@@ -224,7 +224,7 @@ func (p *plugin) createDSQLConnectionWithAuth(
 	}
 
 	// Create the connection using the token-refreshing driver
-	db, err := p.createConnectionWithTokenRefresh(cfg, resolver, tokenProvider, logger)
+	db, _, err := p.createConnectionWithTokenRefresh(cfg, resolver, tokenProvider, logger, metricsHandler)
 	if err != nil {
 		return nil, err
 	}
@@ -237,12 +237,14 @@ func (p *plugin) createDSQLConnectionWithAuth(
 
 // createConnectionWithTokenRefresh creates a database connection using a custom driver
 // that refreshes IAM tokens before each new connection.
+// Returns the database connection and the connection registry for lifecycle tracking.
 func (p *plugin) createConnectionWithTokenRefresh(
 	cfg *config.SQL,
 	resolver resolver.ServiceResolver,
 	tokenProvider driver.TokenProvider,
 	logger log.Logger,
-) (*sqlx.DB, error) {
+	metricsHandler metrics.Handler,
+) (*sqlx.DB, *driver.ConnectionRegistry, error) {
 	// Build the base DSN (with a placeholder password that will be replaced)
 	dsqlConfig := *cfg
 	dsqlConfig.User = adminUser
@@ -251,7 +253,7 @@ func (p *plugin) createConnectionWithTokenRefresh(
 	// Use session to build the DSN
 	baseDSN, err := session.BuildDSN(&dsqlConfig, resolver)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build DSN: %w", err)
+		return nil, nil, fmt.Errorf("failed to build DSN: %w", err)
 	}
 
 	// Register a token-refreshing driver for this connection with logging
@@ -279,9 +281,9 @@ func (p *plugin) createConnectionWithTokenRefresh(
 		logger.Info(msg, tags...)
 	}
 
-	driverName, err := driver.RegisterTokenRefreshingDriverWithLogger(adminUser, tokenProvider, p.rateLimiter, logFunc)
+	driverName, registry, err := driver.RegisterTokenRefreshingDriverWithLogger(adminUser, tokenProvider, p.rateLimiter, logFunc)
 	if err != nil {
-		return nil, fmt.Errorf("failed to register token-refreshing driver: %w", err)
+		return nil, nil, fmt.Errorf("failed to register token-refreshing driver: %w", err)
 	}
 
 	logger.Info("Registered token-refreshing driver for DSQL",
@@ -291,7 +293,7 @@ func (p *plugin) createConnectionWithTokenRefresh(
 	// The driver will call tokenProvider to get a fresh token before each connection
 	sqlDB, err := sql.Open(driverName, baseDSN)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open DSQL connection: %w", err)
+		return nil, nil, fmt.Errorf("failed to open DSQL connection: %w", err)
 	}
 
 	// Wrap with sqlx using "pgx" as the driver name for correct bindvar type ($1, $2, etc.)
@@ -299,7 +301,9 @@ func (p *plugin) createConnectionWithTokenRefresh(
 	db := sqlx.NewDb(sqlDB, "pgx")
 
 	// Apply pool settings
+	targetPoolSize := session.DefaultMaxConns
 	if cfg.MaxConns > 0 {
+		targetPoolSize = cfg.MaxConns
 		db.SetMaxOpenConns(cfg.MaxConns)
 	} else {
 		db.SetMaxOpenConns(session.DefaultMaxConns)
@@ -311,11 +315,13 @@ func (p *plugin) createConnectionWithTokenRefresh(
 		db.SetMaxIdleConns(session.DefaultMaxIdleConns)
 	}
 
+	// Set MaxConnLifetime - Go will close connections older than this.
+	// Pool Keeper will refill to maintain pool size.
+	maxConnLifetime := session.DefaultMaxConnLifetime
 	if cfg.MaxConnLifetime > 0 {
-		db.SetConnMaxLifetime(cfg.MaxConnLifetime)
-	} else {
-		db.SetConnMaxLifetime(session.DefaultMaxConnLifetime)
+		maxConnLifetime = cfg.MaxConnLifetime
 	}
+	db.SetConnMaxLifetime(maxConnLifetime)
 
 	// Set idle time - 0 means connections never expire due to idle time.
 	// This is critical for DSQL: pool must stay at max size always.
@@ -327,27 +333,61 @@ func (p *plugin) createConnectionWithTokenRefresh(
 	// Verify connection works
 	if err := db.Ping(); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to ping DSQL: %w", err)
+		return nil, nil, fmt.Errorf("failed to ping DSQL: %w", err)
 	}
 
 	// Log pool configuration for debugging
 	logger.Info("DSQL connection pool configured",
 		tag.NewInt("max_open_conns", db.Stats().MaxOpenConnections),
 		tag.NewInt("current_open", db.Stats().OpenConnections),
-		tag.NewDurationTag("max_conn_lifetime", session.DefaultMaxConnLifetime),
+		tag.NewInt("cfg_max_conns", cfg.MaxConns),
+		tag.NewInt("cfg_max_idle_conns", cfg.MaxIdleConns),
+		tag.NewDurationTag("max_conn_lifetime", maxConnLifetime),
 		tag.NewDurationTag("max_conn_idle_time", session.DefaultMaxConnIdleTime))
 
-	// Pre-warm the connection pool to avoid cold-start latency under load.
-	// Run synchronously to ensure warmup completes before returning the connection.
-	// This adds startup time but ensures the pool is ready for immediate use.
-	logger.Info("Starting DSQL connection pool warmup")
+	// Pre-warm the connection pool with staggered delays.
+	// Staggering ensures connections hit MaxConnLifetime at different times,
+	// avoiding thundering herd when connections expire.
+	// For large pools, stagger duration is calculated to respect DSQL rate limits.
 	warmupCfg := DefaultPoolWarmupConfig()
-	if err := WarmupPool(context.Background(), db.DB, warmupCfg, logger); err != nil {
+	warmupCfg.TargetConnections = targetPoolSize
+	warmupCfg.StaggerDuration = CalculateStaggerDuration(targetPoolSize)
+
+	logger.Info("Starting DSQL connection pool warmup",
+		tag.NewInt("target_connections", targetPoolSize),
+		tag.NewDurationTag("stagger_duration", warmupCfg.StaggerDuration))
+
+	warmupResult, err := WarmupPool(context.Background(), db.DB, warmupCfg, logger)
+	if err != nil {
 		logger.Warn("DSQL pool warmup failed", tag.Error(err))
 		// Don't fail - warmup is best-effort
 	}
 
-	return db, nil
+	// Close warmed connections to return them to the pool
+	if warmupResult != nil {
+		for _, conn := range warmupResult.Connections {
+			conn.Close() // Returns to pool, doesn't close TCP
+		}
+		logger.Info("DSQL pool warmup complete, connections returned to pool",
+			tag.NewInt("warmed_connections", len(warmupResult.Connections)))
+	}
+
+	// Start the Pool Keeper to maintain pool size.
+	// Go's MaxConnLifetime closes old connections; Keeper refills to target.
+	// MaxConnsPerTick is scaled based on pool size to handle peak expiry rates.
+	keeperCfg := DefaultPoolKeeperConfig(targetPoolSize)
+	keeper := NewPoolKeeper(db.DB, keeperCfg, logger, metricsHandler)
+
+	logger.Info("DSQL pool keeper initialized",
+		tag.NewInt("target_pool_size", targetPoolSize),
+		tag.NewDurationTag("tick_interval", keeperCfg.TickInterval),
+		tag.NewInt("max_conns_per_tick", keeperCfg.MaxConnsPerTick),
+		tag.NewDurationTag("max_conn_lifetime", maxConnLifetime))
+
+	// Start the background keeper goroutine
+	keeper.Start(context.Background())
+
+	return db, registry, nil
 }
 
 // getOrInitTokenCache returns the token cache, initializing it if necessary.

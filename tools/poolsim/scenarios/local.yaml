@@ -1,0 +1,59 @@
+# Local Docker Compose Simulation
+#
+# Simulates a local development deployment with small pools.
+#
+# Total: 200 connections across 4 services
+# Expected convergence: ~2 seconds
+
+seed: 42
+endpoint: cluster.dsql.eu-west-1.on.aws
+
+duration: 20m
+sampleEvery: 1s
+
+limiterPerSec: 100
+
+assertMaxConnectsPerSec: 100
+assertConvergeWithin: 60s    # Allow time for staggered warmup
+assertStableFor: 5s
+assertMaxClosurePerSec: 100  # Allow for some clustering due to fast warmup
+
+scenario:
+  kind: cold_start
+
+services:
+  - name: history
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 30s       # Spread warmup over 30s to avoid thundering herd
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 0s
+
+  - name: matching
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 30s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 100ms
+
+  - name: frontend
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 30s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 200ms
+
+  - name: worker
+    targetOpen: 50
+    maxOpen: 50
+    maxConnLifetime: 10m
+    warmupStagger: 30s
+    keeperTick: 1s
+    maxConnsPerTick: 5
+    startDelay: 300ms

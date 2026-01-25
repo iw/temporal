@@ -54,7 +54,7 @@ func (m *mockConn) Close() error                              { return nil }
 func (m *mockConn) Begin() (driver.Tx, error)                 { return nil, nil }
 
 func TestRegisterTokenRefreshingDriverWithLogger_NilTokenProvider(t *testing.T) {
-	_, err := RegisterTokenRefreshingDriverWithLogger("admin", nil, nil, nil)
+	_, _, err := RegisterTokenRefreshingDriverWithLogger("admin", nil, nil, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "tokenProvider cannot be nil")
 }
@@ -63,9 +63,10 @@ func TestRegisterTokenRefreshingDriverWithLogger_EmptyUsername(t *testing.T) {
 	tokenProvider := func(ctx context.Context) (string, error) {
 		return "token", nil
 	}
-	driverName, err := RegisterTokenRefreshingDriverWithLogger("", tokenProvider, nil, nil)
+	driverName, registry, err := RegisterTokenRefreshingDriverWithLogger("", tokenProvider, nil, nil)
 	require.NoError(t, err)
 	require.Contains(t, driverName, driverNamePrefix)
+	require.NotNil(t, registry)
 }
 
 func TestRegisterTokenRefreshingDriverWithLogger_UniqueDriverNames(t *testing.T) {
@@ -73,10 +74,10 @@ func TestRegisterTokenRefreshingDriverWithLogger_UniqueDriverNames(t *testing.T)
 		return "token", nil
 	}
 
-	name1, err := RegisterTokenRefreshingDriverWithLogger("admin", tokenProvider, nil, nil)
+	name1, _, err := RegisterTokenRefreshingDriverWithLogger("admin", tokenProvider, nil, nil)
 	require.NoError(t, err)
 
-	name2, err := RegisterTokenRefreshingDriverWithLogger("admin", tokenProvider, nil, nil)
+	name2, _, err := RegisterTokenRefreshingDriverWithLogger("admin", tokenProvider, nil, nil)
 	require.NoError(t, err)
 
 	require.NotEqual(t, name1, name2, "Each registration should get a unique driver name")
@@ -89,12 +90,14 @@ func TestTokenRefreshingDriver_RateLimiterCalled(t *testing.T) {
 		return "test-token", nil
 	}
 	mockUnderlying := &mockDriver{conn: &mockConn{}}
+	registry := NewConnectionRegistry()
 
 	// Create the driver directly for testing
 	d := &tokenRefreshingDriver{
 		underlying:    mockUnderlying,
 		tokenProvider: tokenProvider,
 		rateLimiter:   rateLimiter,
+		registry:      registry,
 		username:      "admin",
 		driverName:    "test-driver",
 	}
@@ -108,6 +111,8 @@ func TestTokenRefreshingDriver_RateLimiterCalled(t *testing.T) {
 	require.Equal(t, int64(1), rateLimiter.waitCalls.Load(), "Rate limiter Wait() should be called once")
 	// Verify underlying driver was called
 	require.Equal(t, int64(1), mockUnderlying.openCalls.Load(), "Underlying driver Open() should be called once")
+	// Verify connection was registered
+	require.Equal(t, 1, registry.Count(), "Connection should be registered in registry")
 }
 
 func TestTokenRefreshingDriver_RateLimiterError(t *testing.T) {
@@ -120,11 +125,13 @@ func TestTokenRefreshingDriver_RateLimiterError(t *testing.T) {
 		return "", nil
 	}
 	mockUnderlying := &mockDriver{conn: &mockConn{}}
+	registry := NewConnectionRegistry()
 
 	d := &tokenRefreshingDriver{
 		underlying:    mockUnderlying,
 		tokenProvider: tokenProvider,
 		rateLimiter:   rateLimiter,
+		registry:      registry,
 		username:      "admin",
 		driverName:    "test-driver",
 	}
@@ -144,11 +151,13 @@ func TestTokenRefreshingDriver_RateLimiterContextCancelled(t *testing.T) {
 		return "token", nil
 	}
 	mockUnderlying := &mockDriver{conn: &mockConn{}}
+	registry := NewConnectionRegistry()
 
 	d := &tokenRefreshingDriver{
 		underlying:    mockUnderlying,
 		tokenProvider: tokenProvider,
 		rateLimiter:   rateLimiter,
+		registry:      registry,
 		username:      "admin",
 		driverName:    "test-driver",
 	}
@@ -166,11 +175,13 @@ func TestTokenRefreshingDriver_NilRateLimiter(t *testing.T) {
 		return "test-token", nil
 	}
 	mockUnderlying := &mockDriver{conn: &mockConn{}}
+	registry := NewConnectionRegistry()
 
 	d := &tokenRefreshingDriver{
 		underlying:    mockUnderlying,
 		tokenProvider: tokenProvider,
 		rateLimiter:   nil, // No rate limiter
+		registry:      registry,
 		username:      "admin",
 		driverName:    "test-driver",
 	}
@@ -189,11 +200,13 @@ func TestTokenRefreshingDriver_ConcurrentRateLimiting(t *testing.T) {
 		return "test-token", nil
 	}
 	mockUnderlying := &mockDriver{conn: &mockConn{}}
+	registry := NewConnectionRegistry()
 
 	d := &tokenRefreshingDriver{
 		underlying:    mockUnderlying,
 		tokenProvider: tokenProvider,
 		rateLimiter:   rateLimiter,
+		registry:      registry,
 		username:      "admin",
 		driverName:    "test-driver",
 	}

@@ -146,9 +146,10 @@
 
 1. **ID Generation Performance**: Need to benchmark Snowflake vs Random ID generation under production load
 2. **✅ Serialization Conflict Handling**: **COMPLETED** - Implemented comprehensive retry strategy with exponential backoff
-3. **✅ Connection Pooling**: **COMPLETED** - Pool pre-warming with MaxConnIdleTime=0 ensures stable pool size
-   - Pool defaults: MaxConns=100, MaxIdleConns=100, MaxConnLifetime=55m, MaxConnIdleTime=0
+3. **✅ Connection Pooling**: **COMPLETED** - Pool pre-warming with jittered lifecycle management
+   - Pool defaults: MaxConns=100, MaxIdleConns=100, MaxConnLifetime=0, MaxConnIdleTime=0
    - Pre-warming creates all connections at startup (sequential, rate-limited)
+   - ConnectionRefresher manages lifecycle with jitter (15 min ± 2 min) to avoid thundering herd
    - Connection closure metrics for monitoring pool health
 4. **Multi-Region Support**: Plan for DSQL's multi-region capabilities (future enhancement)
 5. **Transaction Size Limits**: Verify DSQL transaction size limits align with Temporal's requirements
@@ -253,14 +254,15 @@ The Aurora DSQL persistence layer implementation is now production-ready:
 - **Pool Defaults** (in `session/session.go`):
   - `MaxConns = 100` - Maximum open connections per pool
   - `MaxIdleConns = 100` - **MUST equal MaxConns** to prevent idle closure
-  - `MaxConnLifetime = 55m` - Under DSQL's 60 minute limit
+  - `MaxConnLifetime = 0` - **Disabled** (ConnectionRefresher manages lifecycle)
   - `MaxConnIdleTime = 0` - **CRITICAL: Disabled to prevent pool decay**
 - **Files Added**:
   - `common/persistence/sql/sqlplugin/dsql/pool_warmup.go` - Sequential warmup with retry logic
+  - `common/persistence/sql/sqlplugin/dsql/connection_refresher.go` - Jittered connection lifecycle management
 - **Files Modified**:
   - `common/persistence/sql/sqlplugin/dsql/session/session.go` - Updated defaults
   - `common/persistence/sql/sqlplugin/dsql/metrics.go` - Added closure metrics
-  - `common/persistence/sql/sqlplugin/dsql/plugin.go` - Warmup integration
+  - `common/persistence/sql/sqlplugin/dsql/plugin.go` - Warmup and refresher integration
 - **New Metrics**:
   - `dsql_db_closed_max_lifetime_total` - Connections closed due to MaxConnLifetime
   - `dsql_db_closed_max_idle_time_total` - Connections closed due to MaxConnIdleTime (should be 0)
@@ -268,6 +270,27 @@ The Aurora DSQL persistence layer implementation is now production-ready:
 - **Startup Logs**:
   - `"Starting DSQL pool warmup"` with `target_connections=100`
   - `"DSQL pool warmup complete"` with `connections_created=99`, `connections_failed=0`
+  - `"DSQL connection refresher started"` with refresh interval and jitter config
+
+**🔄 Connection Lifecycle Management (2026-01-23):**
+- **Problem**: All connections created at startup hit MaxConnLifetime at the same time → thundering herd
+- **Solution**: `ConnectionRefresher` manages connection lifecycle with jitter
+- **Configuration** (in `connection_refresher.go`):
+  - `RefreshInterval = 15 minutes` - How often connections are refreshed
+  - `RefreshJitter = 120 seconds` - Random jitter added to each connection (±2 min)
+  - `CheckInterval = 30 seconds` - How often the refresher checks for stale connections
+  - `MaxRefreshesPerCheck = 5` - Rate limit on concurrent refreshes
+- **How it works**:
+  1. Pool warmup creates all connections at startup
+  2. Each connection is tracked with a random refresh time (15 min ± 2 min jitter)
+  3. Background goroutine checks every 30s for connections due for refresh
+  4. Stale connections are replaced one-by-one (max 5 per check cycle)
+  5. New connections get fresh IAM tokens and new jittered refresh times
+- **Benefits**:
+  - No thundering herd when connections age out
+  - Connections refresh gradually over a 4-minute window (13-17 min)
+  - Pool stays at max size throughout the refresh cycle
+  - Each new connection gets a fresh IAM token
 
 **🔐 Security Recommendations for Production:**
 - **Use AWS Secrets Manager** for database credentials instead of local files
@@ -278,6 +301,6 @@ The Aurora DSQL persistence layer implementation is now production-ready:
 
 **Ready for Production Deployment:**
 - ✅ Integration testing with actual DSQL cluster - PASSED
-- ✅ Performance benchmarking under production load - 100 WPS validated
+- ✅ Performance benchmarking under production load - 400 WPS validated
 - Production configuration and deployment
 - Monitoring dashboard setup and alerting

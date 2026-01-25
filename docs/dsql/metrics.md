@@ -38,6 +38,14 @@ The `error_class` label can have these values:
 | `dsql_pool_wait_total` | Counter | Times a connection was waited for |
 | `dsql_pool_wait_duration` | Timer | Total time spent waiting for connections |
 
+### Pool Keeper Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dsql_pool_keeper_topup_total` | Counter | Connections created by Pool Keeper |
+| `dsql_pool_keeper_topup_failures_total` | Counter | Failed connection creation attempts |
+| `dsql_pool_keeper_current_size` | Gauge | Current pool size as seen by keeper |
+
 ### Connection Closure Metrics
 
 These metrics track WHY connections are being closed, helping diagnose pool decay:

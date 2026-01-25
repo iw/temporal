@@ -20,24 +20,26 @@ const (
 
 // DSQL-optimized pool defaults
 // These values are chosen to work well with Aurora DSQL's characteristics:
-//   - IAM tokens expire after 15 minutes (configurable via DSQL_TOKEN_DURATION)
-//   - With token-refreshing driver, MaxConnLifetime can be longer since each
-//     new connection gets a fresh token
+//   - IAM tokens have configurable TTL (default 15 minutes via DSQL_TOKEN_DURATION)
+//   - Token-refreshing driver provides fresh tokens for each new connection
 //   - Pool MUST stay at max size to avoid connection creation under load
 //     (DSQL has 100 conn/sec cluster-wide rate limit)
-//   - Pool is pre-warmed at startup to eliminate cold-start latency
+//   - Pool is pre-warmed at startup with staggered delays to spread connection ages
+//   - Pool Keeper continuously tops up pool as connections expire
 const (
-	// DefaultMaxConnLifetime is 55 minutes, safely under DSQL's 60 minute limit.
-	// With the token-refreshing driver, each new connection gets a fresh token,
-	// so this doesn't need to be shorter than token duration.
-	DefaultMaxConnLifetime = 55 * time.Minute
+	// DefaultMaxConnLifetime controls when Go's pool closes connections.
+	// Set to ~70% of token TTL to ensure connections rotate with fresh tokens.
+	// For 15-minute token TTL: 10 minutes provides safe margin.
+	// Go handles closure; Pool Keeper handles refill.
+	// Env override: TEMPORAL_SQL_MAX_CONN_LIFETIME
+	DefaultMaxConnLifetime time.Duration = 10 * time.Minute
 
 	// DefaultMaxConnIdleTime is 0 (disabled).
 	// CRITICAL: Must be 0 to prevent pool decay. Go's database/sql closes
 	// connections idle longer than this, even if MaxIdleConns allows them.
 	// With DSQL's 100 conn/sec rate limit, we cannot afford to recreate
 	// connections under load - the pool must stay at max size always.
-	DefaultMaxConnIdleTime = 0
+	DefaultMaxConnIdleTime time.Duration = 0
 
 	// DefaultMaxConns is the default maximum number of open connections.
 	// Set to 100 to handle shard acquisition bursts and high concurrency workloads.
