@@ -281,6 +281,142 @@ func (p *plugin) createConnectionWithTokenRefresh(
 		logger.Info(msg, tags...)
 	}
 
+	// Reservoir mode: driver.Open() must never block on global limiters.
+	// We achieve this by sourcing physical connections from an in-process reservoir
+	// refilled by a background goroutine which is the only place that waits on
+	// global rate/conn-count limiters.
+	if IsReservoirEnabled() {
+		maxOpen := cfg.MaxConns
+		if maxOpen <= 0 {
+			maxOpen = session.DefaultMaxConns
+		}
+		resCfg := GetReservoirConfig(maxOpen)
+
+		// Optional distributed conn-count lease limiter.
+		var leaseMgr driver.LeaseManager
+		if IsDistributedConnLeaseEnabled() {
+			table := GetDistributedConnLeaseTable()
+			if table == "" {
+				logger.Error("Distributed conn lease enabled but DSQL_DISTRIBUTED_CONN_LEASE_TABLE not set; proceeding without global conn count limiting")
+			} else {
+				ddbClient, err := p.createDynamoDBClient(context.Background(), os.Getenv("AWS_REGION"), logger)
+				if err != nil {
+					logger.Error("Failed to create DynamoDB client for distributed conn leases; proceeding without global conn count limiting", tag.Error(err))
+				} else {
+					leases, err := NewDistributedConnLeases(ddbClient, table, os.Getenv("CLUSTER_ENDPOINT"), "unknown", GetDistributedConnLimit(), DefaultDistributedConnLeaseTTL, logger)
+					if err != nil {
+						logger.Error("Failed to initialize distributed conn leases; proceeding without global conn count limiting", tag.Error(err))
+					} else {
+						leaseMgr = leases
+					}
+				}
+			}
+		}
+
+		// Create reservoir metrics using the metrics handler
+		reservoirMetrics := NewReservoirMetrics(metricsHandler)
+
+		driverName, res, err := driver.RegisterReservoirDriverWithLogger(
+			adminUser,
+			baseDSN,
+			tokenProvider,
+			p.rateLimiter,
+			leaseMgr,
+			driver.ReservoirConfig{
+				TargetReady:  resCfg.TargetReady,
+				LowWatermark: resCfg.LowWatermark,
+				BaseLifetime: resCfg.BaseLifetime,
+				Jitter:       resCfg.Jitter,
+				GuardWindow:  resCfg.GuardWindow,
+			},
+			logFunc,
+			reservoirMetrics,
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to register reservoir driver: %w", err)
+		}
+
+		logger.Info("Registered reservoir-backed driver for DSQL", tag.NewStringTag("driver_name", driverName))
+
+		// Wait for reservoir to reach low watermark before accepting requests.
+		// This ensures the service has connections available when it starts handling traffic.
+		logger.Info("Waiting for reservoir initial fill",
+			tag.NewInt("target", resCfg.LowWatermark),
+			tag.NewDurationTag("timeout", resCfg.InitialFillTimeout))
+
+		fillCtx, fillCancel := context.WithTimeout(context.Background(), resCfg.InitialFillTimeout)
+		defer fillCancel()
+
+		fillStart := time.Now()
+		timedOut := false
+	fillLoop:
+		for res.Len() < resCfg.LowWatermark {
+			select {
+			case <-fillCtx.Done():
+				timedOut = true
+				break fillLoop
+			case <-time.After(100 * time.Millisecond):
+				// Check again
+			}
+		}
+
+		fillDuration := time.Since(fillStart)
+		currentSize := res.Len()
+
+		if timedOut {
+			logger.Warn("Reservoir initial fill timeout - proceeding with partial fill",
+				tag.NewInt("current", currentSize),
+				tag.NewInt("target", resCfg.LowWatermark),
+				tag.NewDurationTag("elapsed", fillDuration))
+		} else {
+			logger.Info("Reservoir initial fill complete",
+				tag.NewInt("current", currentSize),
+				tag.NewInt("target", resCfg.LowWatermark),
+				tag.NewDurationTag("elapsed", fillDuration))
+		}
+
+		sqlDB, err := sql.Open(driverName, baseDSN)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to open DSQL connection (reservoir): %w", err)
+		}
+		db := sqlx.NewDb(sqlDB, "pgx")
+
+		// Pool settings: database/sql pool acts as borrower/returner only.
+		if cfg.MaxConns > 0 {
+			db.SetMaxOpenConns(cfg.MaxConns)
+		} else {
+			db.SetMaxOpenConns(session.DefaultMaxConns)
+		}
+		if cfg.MaxIdleConns > 0 {
+			db.SetMaxIdleConns(cfg.MaxIdleConns)
+		} else {
+			db.SetMaxIdleConns(session.DefaultMaxIdleConns)
+		}
+		// Disable database/sql driven lifetime/idle closures when using reservoir.
+		// The reservoir manages connection lifecycle internally.
+		db.SetConnMaxLifetime(0)
+		db.SetConnMaxIdleTime(0)
+		db.MapperFunc(strcase.ToSnake)
+
+		if err := db.Ping(); err != nil {
+			db.Close()
+			return nil, nil, fmt.Errorf("failed to ping DSQL (reservoir): %w", err)
+		}
+
+		logger.Info("DSQL reservoir mode enabled",
+			tag.NewInt("reservoir_target_ready", resCfg.TargetReady),
+			tag.NewInt("reservoir_low_watermark", resCfg.LowWatermark),
+			tag.NewDurationTag("reservoir_base_lifetime", resCfg.BaseLifetime),
+			tag.NewDurationTag("reservoir_lifetime_jitter", resCfg.Jitter),
+			tag.NewDurationTag("reservoir_guard_window", resCfg.GuardWindow),
+			tag.NewDurationTag("reservoir_initial_fill_timeout", resCfg.InitialFillTimeout),
+		)
+
+		// Return nil for registry - reservoir mode doesn't use connection registry
+		return db, nil, nil
+	}
+
+	// Non-reservoir mode: use token-refreshing driver with pool warmup and keeper
 	driverName, registry, err := driver.RegisterTokenRefreshingDriverWithLogger(adminUser, tokenProvider, p.rateLimiter, logFunc)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to register token-refreshing driver: %w", err)

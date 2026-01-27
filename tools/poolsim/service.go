@@ -4,15 +4,14 @@ import (
 	"time"
 )
 
-// Service represents a Temporal service with its pool, warmup, keeper, and workload.
+// Service represents a Temporal service with its reservoir, refiller, and workload.
 type Service struct {
 	Name   string
 	Config ServiceConfig
 
-	Pool     *Pool
-	Warmup   *Warmup
-	Keeper   *Keeper
-	Workload *Workload
+	Reservoir *Reservoir
+	Refiller  *Refiller
+	Workload  *ReservoirWorkload
 }
 
 // NewService creates a new service with all components.
@@ -23,65 +22,52 @@ func NewService(
 	metrics *Metrics,
 	sim *Sim,
 ) *Service {
-	pool := NewPool(cfg.Name, cfg.MaxOpen, cfg.MaxConnLifetime)
+	reservoir := NewReservoir(
+		cfg.Name,
+		cfg.TargetReady,
+		cfg.GuardWindow,
+		cfg.BaseLifetime,
+		cfg.Jitter,
+	)
 
-	warmup := &Warmup{
-		ServiceName:  cfg.Name,
-		Endpoint:     endpoint,
-		Pool:         pool,
-		Limiter:      limiter,
-		Metrics:      metrics,
-		TargetConns:  cfg.TargetOpen,
-		StaggerDur:   cfg.WarmupStagger,
-		MaxRetries:   5,
-		RetryBackoff: 200 * time.Millisecond,
-		Sim:          sim,
-	}
-
-	keeper := &Keeper{
-		ServiceName:     cfg.Name,
-		Endpoint:        endpoint,
-		Pool:            pool,
-		Limiter:         limiter,
-		Metrics:         metrics,
-		Target:          cfg.TargetOpen,
-		MaxConnsPerTick: cfg.MaxConnsPerTick,
-		TickInterval:    cfg.KeeperTick,
-		Sim:             sim,
-	}
-
-	workload := &Workload{
+	refiller := &Refiller{
 		ServiceName: cfg.Name,
 		Endpoint:    endpoint,
-		Cfg:         cfg.Workload,
-		Pool:        pool,
+		Reservoir:   reservoir,
 		Limiter:     limiter,
 		Metrics:     metrics,
 		Sim:         sim,
 	}
 
+	workload := &ReservoirWorkload{
+		ServiceName: cfg.Name,
+		Endpoint:    endpoint,
+		Cfg:         cfg.Workload,
+		Reservoir:   reservoir,
+		Metrics:     metrics,
+		Sim:         sim,
+	}
+
 	return &Service{
-		Name:     cfg.Name,
-		Config:   cfg,
-		Pool:     pool,
-		Warmup:   warmup,
-		Keeper:   keeper,
-		Workload: workload,
+		Name:      cfg.Name,
+		Config:    cfg,
+		Reservoir: reservoir,
+		Refiller:  refiller,
+		Workload:  workload,
 	}
 }
 
-// Start begins the service (warmup, then keeper, then workload).
+// Start begins the service (refiller + expiry scanner, then workload).
 func (s *Service) Start(at time.Time) {
-	// Start warmup immediately
-	s.Warmup.Start(at)
+	// Start refiller and expiry scanner immediately
+	s.Refiller.Start(at)
 
-	// Start keeper after warmup would complete
-	keeperStart := at.Add(s.Config.WarmupStagger + 1*time.Second)
-	s.Keeper.Start(keeperStart)
-
-	// Start workload after warmup (if enabled)
+	// Start workload after initial fill would complete (if enabled)
+	// Estimate: target / rate_limit seconds
 	if s.Config.Workload.Enabled {
-		workloadStart := at.Add(s.Config.WarmupStagger + 2*time.Second)
+		// Give time for initial fill - estimate based on target and typical rate
+		initialFillTime := time.Duration(s.Config.TargetReady) * 20 * time.Millisecond // ~50/sec
+		workloadStart := at.Add(initialFillTime + 1*time.Second)
 		s.Workload.Start(workloadStart)
 	}
 }

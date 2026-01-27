@@ -39,8 +39,9 @@ const (
 
 // consecutiveFailuresBeforeStop is the number of consecutive "database is closed"
 // errors before the keeper stops. This prevents premature shutdown during startup
-// when temporary pools may be created and closed.
-const consecutiveFailuresBeforeStop = 3
+// when temporary pools may be created and closed. Set high enough to survive
+// Temporal's initialization phase where multiple temporary pools are created.
+const consecutiveFailuresBeforeStop = 10
 
 // DefaultPoolKeeperConfig returns configuration scaled for the pool size.
 // For large pools (500+), MaxConnsPerTick is calculated to handle peak
@@ -207,6 +208,11 @@ func (pk *PoolKeeper) tick(ctx context.Context) {
 		}
 		return
 	}
+
+	// Reset consecutive failures counter when we see a healthy pool
+	pk.mu.Lock()
+	pk.consecutiveClosedFailures = 0
+	pk.mu.Unlock()
 
 	currentOpen := stats.OpenConnections
 

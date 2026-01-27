@@ -81,6 +81,18 @@ DSQL has a cluster-wide limit of 100 new connections per second. The plugin prov
 
 **Important**: Rate limiting only applies to NEW connection establishment (TCP/TLS handshake + IAM authentication), not to queries. Once a connection is in the pool, queries flow through without rate limiting.
 
+### Connection Reservoir (Advanced)
+
+For high-throughput workloads, the plugin provides an optional Connection Reservoir mode that maintains a buffer of pre-created connections:
+
+- Decouples connection acquisition from rate-limited creation
+- Background refiller continuously maintains the reservoir
+- Non-blocking `driver.Open()` for instant connection checkout
+- Automatic connection lifecycle management with jittered expiry
+- Optional DynamoDB-backed global connection count limiting
+
+See [Reservoir Design](reservoir-design.md) for detailed documentation.
+
 ## Configuration
 
 ### Basic Configuration
@@ -126,6 +138,25 @@ persistence:
 | `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT` | `100` | Cluster-wide connections per second |
 | `DSQL_DISTRIBUTED_RATE_LIMITER_MAX_WAIT` | `30s` | Maximum wait time for connection permit |
 
+#### Connection Reservoir (Advanced)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSQL_RESERVOIR_ENABLED` | `false` | Enable reservoir mode |
+| `DSQL_RESERVOIR_TARGET_READY` | `maxOpen` | Target reservoir size |
+| `DSQL_RESERVOIR_LOW_WATERMARK` | `maxOpen` | Aggressive refill threshold |
+| `DSQL_RESERVOIR_BASE_LIFETIME` | `11m` | Base connection lifetime |
+| `DSQL_RESERVOIR_LIFETIME_JITTER` | `2m` | Lifetime jitter range |
+| `DSQL_RESERVOIR_GUARD_WINDOW` | `45s` | Discard if remaining lifetime within this |
+
+#### Distributed Connection Leasing (with Reservoir)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSQL_DISTRIBUTED_CONN_LEASE_ENABLED` | `false` | Enable global connection count limiting |
+| `DSQL_DISTRIBUTED_CONN_LEASE_TABLE` | - | DynamoDB table name for leases |
+| `DSQL_DISTRIBUTED_CONN_LIMIT` | `10000` | Global connection limit |
+
 ### Dynamic Configuration
 
 ```yaml
@@ -159,9 +190,10 @@ Aurora DSQL has specific limitations that the plugin handles:
 
 ## Documentation
 
-- **[Implementation Details](dsql-implementation.md)** - Technical implementation, code structure, and internals
-- **[Metrics Reference](dsql-metrics.md)** - Available metrics for monitoring and alerting
-- **[Migration Guide](dsql-migration-guide.md)** - Migrating from PostgreSQL to DSQL
+- **[Implementation Details](implementation.md)** - Technical implementation, code structure, and internals
+- **[Metrics Reference](metrics.md)** - Available metrics for monitoring and alerting
+- **[Migration Guide](migration-guide.md)** - Migrating from PostgreSQL to DSQL
+- **[Reservoir Design](reservoir-design.md)** - Connection reservoir architecture and configuration
 
 ## Quick Start
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"sort"
 	"time"
 )
@@ -37,7 +36,7 @@ func AssertConverge(cfg *Config, m *Metrics) error {
 	target := make(map[string]int)
 	startDelay := make(map[string]time.Duration)
 	for _, s := range cfg.Services {
-		target[s.Name] = s.TargetOpen
+		target[s.Name] = s.TargetReady
 		startDelay[s.Name] = s.StartDelay
 	}
 
@@ -66,12 +65,14 @@ func AssertConverge(cfg *Config, m *Metrics) error {
 		}
 
 		// Find when service first reached target
+		// Note: We check Size + InUse because connections in use are still "owned" by the reservoir
 		var reachedAt *time.Time
 		for i := range samples {
 			if samples[i].Time.Before(t0) {
 				continue
 			}
-			if samples[i].Open >= tgt {
+			total := samples[i].Size + samples[i].InUse
+			if total >= tgt {
 				t := samples[i].Time
 				reachedAt = &t
 				break
@@ -80,8 +81,9 @@ func AssertConverge(cfg *Config, m *Metrics) error {
 
 		if reachedAt == nil {
 			last := samples[len(samples)-1]
-			return fmt.Errorf("service %s never reached target open=%d (last open=%d at %s)",
-				svc, tgt, last.Open, last.Time.Format(time.RFC3339))
+			total := last.Size + last.InUse
+			return fmt.Errorf("service %s never reached target=%d (last size=%d, inUse=%d, total=%d at %s)",
+				svc, tgt, last.Size, last.InUse, total, last.Time.Format(time.RFC3339))
 		}
 
 		if reachedAt.After(deadline) {
@@ -90,6 +92,7 @@ func AssertConverge(cfg *Config, m *Metrics) error {
 		}
 
 		// Check stability if required
+		// Note: We check Size + InUse because connections in use are still "owned" by the reservoir
 		if stableFor > 0 {
 			stableUntil := reachedAt.Add(stableFor)
 			for i := range samples {
@@ -99,9 +102,10 @@ func AssertConverge(cfg *Config, m *Metrics) error {
 				if samples[i].Time.After(stableUntil) {
 					break
 				}
-				if samples[i].Open < tgt {
-					return fmt.Errorf("service %s not stable at target: dropped below %d at %s (open=%d)",
-						svc, tgt, samples[i].Time.Format(time.RFC3339), samples[i].Open)
+				total := samples[i].Size + samples[i].InUse
+				if total < tgt {
+					return fmt.Errorf("service %s not stable at target: dropped below %d at %s (size=%d, inUse=%d, total=%d)",
+						svc, tgt, samples[i].Time.Format(time.RFC3339), samples[i].Size, samples[i].InUse, total)
 				}
 			}
 		}
@@ -109,36 +113,11 @@ func AssertConverge(cfg *Config, m *Metrics) error {
 	return nil
 }
 
-// AssertClosureSpike detects thundering herd by checking closure rate.
-func AssertClosureSpike(cfg *Config, m *Metrics) error {
-	limit := cfg.AssertMaxClosurePerSec
-	if limit <= 0 {
-		return nil
-	}
-
-	type lastKey struct{ svc string }
-	last := make(map[lastKey]Sample)
-	closuresPerSec := make(map[int64]float64)
-
-	samples := m.Samples()
-	for _, s := range samples {
-		k := lastKey{svc: s.Service}
-		if prev, ok := last[k]; ok {
-			dLife := float64(s.ClosedLifetime - prev.ClosedLifetime)
-			dSrv := float64(s.ClosedServer - prev.ClosedServer)
-			d := dLife + dSrv
-			if d < 0 {
-				d = 0
-			}
-			closuresPerSec[s.Time.Unix()] += d
-		}
-		last[k] = s
-	}
-
-	for sec, c := range closuresPerSec {
-		if int(math.Ceil(c)) > limit {
-			return fmt.Errorf("closure spike exceeded: sec=%d closures=%.2f limit=%d", sec, c, limit)
-		}
+// AssertZeroEmptyEvents verifies no checkout attempts found an empty reservoir.
+func AssertZeroEmptyEvents(m *Metrics) error {
+	total := m.TotalEmptyEvents()
+	if total > 0 {
+		return fmt.Errorf("reservoir had %d empty events (checkout attempts when empty)", total)
 	}
 	return nil
 }

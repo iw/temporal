@@ -4,9 +4,9 @@
 # Uses the local configuration for fast testing.
 #
 # Scenario:
-# - Services start and reach steady state
+# - Services start and fill reservoir
 # - At 5 minutes, 50% of connections are dropped
-# - Observe recovery time
+# - Observe recovery time (refiller should quickly restore)
 
 seed: 42
 endpoint: cluster.dsql.eu-west-1.on.aws
@@ -18,7 +18,8 @@ limiterPerSec: 100
 
 assertMaxConnectsPerSec: 100
 assertConvergeWithin: 60s
-assertMaxClosurePerSec: 200
+assertStableFor: 5s
+assertZeroEmptyEvents: true
 
 scenario:
   kind: mass_drop
@@ -27,37 +28,29 @@ scenario:
 
 services:
   - name: history
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 0s
 
   - name: matching
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 100ms
 
   - name: frontend
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 200ms
 
   - name: worker
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 300ms

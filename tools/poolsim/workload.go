@@ -8,46 +8,45 @@ import (
 // WorkloadConfig configures simulated database workload.
 type WorkloadConfig struct {
 	// Enabled controls whether workload simulation runs.
-	Enabled bool
+	Enabled bool `json:"enabled" yaml:"enabled"`
 
 	// MaxInUse is the target number of concurrent connections in use.
 	// Workload will try to maintain this many active "queries".
-	MaxInUse int
+	MaxInUse int `json:"maxInUse" yaml:"maxInUse"`
 
 	// HoldTime is how long each "query" holds a connection.
-	HoldTime time.Duration
+	HoldTime time.Duration `json:"holdTime" yaml:"holdTime"`
 
 	// HoldJitter adds randomness to hold time (0 to HoldJitter added).
-	HoldJitter time.Duration
+	HoldJitter time.Duration `json:"holdJitter" yaml:"holdJitter"`
 
 	// SpawnEvery is how often the workload spawns new work.
-	SpawnEvery time.Duration
+	SpawnEvery time.Duration `json:"spawnEvery" yaml:"spawnEvery"`
 
 	// ArrivalBurst is max work items to start per spawn tick.
-	ArrivalBurst int
+	ArrivalBurst int `json:"arrivalBurst" yaml:"arrivalBurst"`
 
 	// MaxWait is max time to wait for a connection before giving up.
-	MaxWait time.Duration
+	MaxWait time.Duration `json:"maxWait" yaml:"maxWait"`
 }
 
-// Workload simulates database queries consuming connections.
+// ReservoirWorkload simulates database queries consuming connections from the reservoir.
 // This models Temporal's persistence layer making database calls.
-type Workload struct {
+type ReservoirWorkload struct {
 	ServiceName string
 	Endpoint    string
 
 	Cfg WorkloadConfig
 
-	Pool    *Pool
-	Limiter RateLimiter
-	Metrics *Metrics
-	Sim     *Sim
+	Reservoir *Reservoir
+	Metrics   *Metrics
+	Sim       *Sim
 
 	startedAt time.Time
 }
 
 // Start begins the workload simulation.
-func (w *Workload) Start(at time.Time) {
+func (w *ReservoirWorkload) Start(at time.Time) {
 	if !w.Cfg.Enabled {
 		return
 	}
@@ -57,11 +56,11 @@ func (w *Workload) Start(at time.Time) {
 	})
 }
 
-func (w *Workload) tick() {
+func (w *ReservoirWorkload) tick() {
 	now := w.Sim.Now()
 
 	// How many connections are currently in use?
-	stats := w.Pool.Stats()
+	stats := w.Reservoir.Stats()
 	inUse := stats.InUse
 
 	// How many more do we need to reach MaxInUse?
@@ -89,25 +88,14 @@ func (w *Workload) tick() {
 	})
 }
 
-func (w *Workload) tryStartOne(now time.Time) {
-	br := w.Pool.Borrow(now, w.Limiter, w.Endpoint)
-
-	if br.WaitFor > 0 {
-		// Need to wait - record and retry
-		w.Metrics.RecordPoolWait(now, w.ServiceName, br.WaitFor, br.DeniedByLimiter)
-
-		// Retry if within MaxWait
-		if w.Cfg.MaxWait > 0 && now.Sub(w.startedAt) < w.Cfg.MaxWait {
-			w.Sim.After(br.WaitFor, w.ServiceName+":work_retry", func() {
-				w.tryStartOne(w.Sim.Now())
-			})
-		}
+func (w *ReservoirWorkload) tryStartOne(now time.Time) {
+	// Try to checkout from reservoir (non-blocking)
+	conn, ok := w.Reservoir.TryCheckout(now)
+	if !ok {
+		// Reservoir empty - this is what we want to avoid!
+		// In production, this would return ErrBadConn and trigger retry
+		// For simulation, we just record the empty event (already done in TryCheckout)
 		return
-	}
-
-	// Got a connection - record if we opened a new one
-	if br.Opened {
-		w.Metrics.RecordWorkloadOpen(now, w.ServiceName)
 	}
 
 	w.Metrics.RecordWorkStarted(now, w.ServiceName)
@@ -119,9 +107,9 @@ func (w *Workload) tryStartOne(now time.Time) {
 	}
 
 	// Schedule release
-	connID := br.ConnID
 	w.Sim.After(hold, w.ServiceName+":work_release", func() {
-		w.Pool.Release(connID)
-		w.Metrics.RecordWorkCompleted(w.Sim.Now(), w.ServiceName)
+		releaseTime := w.Sim.Now()
+		w.Reservoir.Return(conn, releaseTime)
+		w.Metrics.RecordWorkCompleted(releaseTime, w.ServiceName)
 	})
 }

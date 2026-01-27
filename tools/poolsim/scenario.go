@@ -9,7 +9,7 @@ import (
 func ApplyScenario(cfg *Config, sim *Sim, services map[string]*Service) error {
 	switch cfg.Scenario.Kind {
 	case "cold_start":
-		// Nothing extra - services just start and warm up
+		// Nothing extra - services just start and fill reservoir
 		return nil
 
 	case "rolling_restart":
@@ -24,8 +24,8 @@ func ApplyScenario(cfg *Config, sim *Sim, services map[string]*Service) error {
 			names = append(names, name)
 		}
 
-		// Schedule restarts starting after initial warmup period
-		startAt := sim.Now().Add(5 * time.Minute) // Give time for initial warmup
+		// Schedule restarts starting after initial fill period
+		startAt := sim.Now().Add(5 * time.Minute) // Give time for initial fill
 		for i := 0; ; i++ {
 			restartAt := startAt.Add(time.Duration(i) * rollEvery)
 			if restartAt.After(sim.End()) {
@@ -35,7 +35,7 @@ func ApplyScenario(cfg *Config, sim *Sim, services map[string]*Service) error {
 			name := names[i%len(names)]
 			svc := services[name]
 			sim.Schedule(restartAt, "rolling_restart:"+name, func() {
-				svc.Pool.DropAll()
+				svc.Reservoir.DropAll()
 			})
 		}
 		return nil
@@ -50,7 +50,7 @@ func ApplyScenario(cfg *Config, sim *Sim, services map[string]*Service) error {
 
 		sim.Schedule(dropAt, "mass_drop", func() {
 			for _, svc := range services {
-				svc.Pool.DropFraction(frac)
+				svc.Reservoir.DropFraction(frac)
 			}
 		})
 		return nil
