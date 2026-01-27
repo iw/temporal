@@ -8,32 +8,38 @@ import (
 	"time"
 )
 
-// Sample represents a point-in-time snapshot of pool state.
+// Sample represents a point-in-time snapshot of reservoir state.
 type Sample struct {
-	Time           time.Time
-	Service        string
-	Open           int
-	Idle           int
-	InUse          int
-	Target         int
-	ClosedLifetime int64
-	ClosedServer   int64
-	WarmupOpens    int64
-	KeeperOpens    int64
-	WorkloadOpens  int64
+	Time    time.Time
+	Service string
+
+	// Reservoir state
+	Size   int
+	Target int
+	InUse  int
+
+	// Cumulative counters
+	Checkouts      int64
+	EmptyEvents    int64
+	Discards       int64
+	DiscardExpired int64
+	DiscardGuard   int64
+	DiscardFull    int64
+	Refills        int64
+	RefillFailures int64
+	ScanEvictions  int64
 	LimiterDenies  int64
-	PoolWaits      int64
-	WorkStarted    int64
-	WorkCompleted  int64
+
+	// Workload stats
+	WorkStarted   int64
+	WorkCompleted int64
 }
 
 // Metrics collects simulation metrics.
 type Metrics struct {
-	warmupOpens   map[string]int64
-	keeperOpens   map[string]int64
-	workloadOpens map[string]int64
+	refillerOpens map[string]int64
+	scanEvictions map[string]int64
 	limiterDenies map[string]int64
-	poolWaits     map[string]int64
 	workStarted   map[string]int64
 	workCompleted map[string]int64
 
@@ -46,11 +52,9 @@ type Metrics struct {
 // NewMetrics creates a new metrics collector.
 func NewMetrics() *Metrics {
 	return &Metrics{
-		warmupOpens:    make(map[string]int64),
-		keeperOpens:    make(map[string]int64),
-		workloadOpens:  make(map[string]int64),
+		refillerOpens:  make(map[string]int64),
+		scanEvictions:  make(map[string]int64),
 		limiterDenies:  make(map[string]int64),
-		poolWaits:      make(map[string]int64),
 		workStarted:    make(map[string]int64),
 		workCompleted:  make(map[string]int64),
 		globalConnects: make(map[int64]int),
@@ -58,35 +62,20 @@ func NewMetrics() *Metrics {
 	}
 }
 
-// RecordWarmupOpen records a connection opened during warmup.
-func (m *Metrics) RecordWarmupOpen(now time.Time, service string) {
-	m.warmupOpens[service]++
+// RecordRefillerOpen records a connection created by the refiller.
+func (m *Metrics) RecordRefillerOpen(now time.Time, service string) {
+	m.refillerOpens[service]++
 	m.globalConnects[now.Unix()]++
 }
 
-// RecordKeeperOpen records a connection opened by the keeper.
-func (m *Metrics) RecordKeeperOpen(now time.Time, service string) {
-	m.keeperOpens[service]++
-	m.globalConnects[now.Unix()]++
-}
-
-// RecordWorkloadOpen records a connection opened by workload demand.
-func (m *Metrics) RecordWorkloadOpen(now time.Time, service string) {
-	m.workloadOpens[service]++
-	m.globalConnects[now.Unix()]++
+// RecordScanEvictions records connections evicted by the expiry scanner.
+func (m *Metrics) RecordScanEvictions(now time.Time, service string, count int) {
+	m.scanEvictions[service] += int64(count)
 }
 
 // RecordLimiterDeny records a rate limit denial.
 func (m *Metrics) RecordLimiterDeny(now time.Time, service string) {
 	m.limiterDenies[service]++
-}
-
-// RecordPoolWait records when workload had to wait for a connection.
-func (m *Metrics) RecordPoolWait(now time.Time, service string, waitDur time.Duration, deniedByLimiter bool) {
-	m.poolWaits[service]++
-	if deniedByLimiter {
-		m.limiterDenies[service]++
-	}
 }
 
 // RecordWorkStarted records a work item starting.
@@ -99,23 +88,25 @@ func (m *Metrics) RecordWorkCompleted(now time.Time, service string) {
 	m.workCompleted[service]++
 }
 
-// Snapshot captures current pool state.
-func (m *Metrics) Snapshot(now time.Time, service string, pool *Pool, target int) {
-	stats := pool.Stats()
+// Snapshot captures current reservoir state.
+func (m *Metrics) Snapshot(now time.Time, service string, reservoir *Reservoir) {
+	stats := reservoir.Stats()
 	m.samples = append(m.samples, Sample{
 		Time:           now,
 		Service:        service,
-		Open:           stats.Open,
-		Idle:           stats.Idle,
+		Size:           stats.Size,
+		Target:         stats.Target,
 		InUse:          stats.InUse,
-		Target:         target,
-		ClosedLifetime: stats.ClosedLifetime,
-		ClosedServer:   stats.ClosedServer,
-		WarmupOpens:    m.warmupOpens[service],
-		KeeperOpens:    m.keeperOpens[service],
-		WorkloadOpens:  m.workloadOpens[service],
+		Checkouts:      stats.Checkouts,
+		EmptyEvents:    stats.EmptyEvents,
+		Discards:       stats.Discards,
+		DiscardExpired: stats.DiscardExpired,
+		DiscardGuard:   stats.DiscardGuard,
+		DiscardFull:    stats.DiscardFull,
+		Refills:        stats.Refills,
+		RefillFailures: stats.RefillFailures,
+		ScanEvictions:  m.scanEvictions[service],
 		LimiterDenies:  m.limiterDenies[service],
-		PoolWaits:      m.poolWaits[service],
 		WorkStarted:    m.workStarted[service],
 		WorkCompleted:  m.workCompleted[service],
 	})
@@ -133,10 +124,12 @@ func (m *Metrics) WriteCSV(path string) error {
 	defer w.Flush()
 
 	header := []string{
-		"t_rfc3339", "service", "open", "idle", "in_use", "target",
-		"closed_lifetime", "closed_server",
-		"warmup_opens", "keeper_opens", "workload_opens",
-		"limiter_denies", "pool_waits",
+		"t_rfc3339", "service",
+		"size", "target", "in_use",
+		"checkouts", "empty_events",
+		"discards", "discard_expired", "discard_guard", "discard_full",
+		"refills", "refill_failures", "scan_evictions",
+		"limiter_denies",
 		"work_started", "work_completed",
 	}
 	if err := w.Write(header); err != nil {
@@ -147,17 +140,19 @@ func (m *Metrics) WriteCSV(path string) error {
 		row := []string{
 			s.Time.Format(time.RFC3339),
 			s.Service,
-			fmt.Sprintf("%d", s.Open),
-			fmt.Sprintf("%d", s.Idle),
-			fmt.Sprintf("%d", s.InUse),
+			fmt.Sprintf("%d", s.Size),
 			fmt.Sprintf("%d", s.Target),
-			fmt.Sprintf("%d", s.ClosedLifetime),
-			fmt.Sprintf("%d", s.ClosedServer),
-			fmt.Sprintf("%d", s.WarmupOpens),
-			fmt.Sprintf("%d", s.KeeperOpens),
-			fmt.Sprintf("%d", s.WorkloadOpens),
+			fmt.Sprintf("%d", s.InUse),
+			fmt.Sprintf("%d", s.Checkouts),
+			fmt.Sprintf("%d", s.EmptyEvents),
+			fmt.Sprintf("%d", s.Discards),
+			fmt.Sprintf("%d", s.DiscardExpired),
+			fmt.Sprintf("%d", s.DiscardGuard),
+			fmt.Sprintf("%d", s.DiscardFull),
+			fmt.Sprintf("%d", s.Refills),
+			fmt.Sprintf("%d", s.RefillFailures),
+			fmt.Sprintf("%d", s.ScanEvictions),
 			fmt.Sprintf("%d", s.LimiterDenies),
-			fmt.Sprintf("%d", s.PoolWaits),
 			fmt.Sprintf("%d", s.WorkStarted),
 			fmt.Sprintf("%d", s.WorkCompleted),
 		}
@@ -182,6 +177,17 @@ func (m *Metrics) MaxConnectsPerSecond() int {
 		}
 	}
 	return max
+}
+
+// TotalEmptyEvents returns total empty events across all services.
+func (m *Metrics) TotalEmptyEvents() int64 {
+	var total int64
+	for _, s := range m.samples {
+		if s.EmptyEvents > total {
+			total = s.EmptyEvents
+		}
+	}
+	return total
 }
 
 // Samples returns a sorted copy of all samples.

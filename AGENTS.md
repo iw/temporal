@@ -35,272 +35,108 @@
 - Cover success and failure cases for persistence adapters, config guards, and migrations.
 - Include regression tests for mixed persistence/visibility backends.
 - Leverage deterministic fixtures; avoid flaky integration tests unless tagged with `integration`.
+- Prefer `require` over `assert`, avoid testify suites in unit tests, use `require.Eventually` instead of `time.Sleep`.
 
 ## Operational Considerations
 - Document rollout/rollback instructions for operators (config flags, schema migrations, fallback options).
 - Ensure metrics/alerts exist for Aurora DSQL health and latency; extend `/common/metrics` definitions when necessary.
 - Capture open questions (consistency model, transaction semantics, failure domains) in tracking issues or this document.
 
-## Testing:
-- Write tests for new functionality
-- Run tests after altering code or tests
-- Start with unit tests for fastest feedback
-- Prefer `require` over `assert`, avoid testify suites in unit tests (functional tests require suites for test cluster setup), use `require.Eventually` instead of `time.Sleep` (forbidden by linter)
-
-## Coordination & Tracking
-- Keep this file updated with new decisions, constraints, and pending investigations.
-- Record owned tasks, open questions, and verification status before handing work to another agent.
-- When blocked by sandbox/approvals, note the required command and reason so the next agent can proceed efficiently.
-
 ---
 
 ## Implementation Status
 
-### Completed (2025-01-05)
+### ✅ Completed
 
 #### Schema Compatibility
-- ✅ Analyzed PostgreSQL schema for DSQL compatibility
-- ✅ Created DSQL-compatible schema (`schema/dsql/v12/temporal/schema.sql`)
-  - Removed BIGSERIAL → BIGINT with application-level ID generation
-  - Removed CHECK constraints → application-level validation
-  - Removed complex DEFAULT expressions → application-level defaults
-  - Converted inline UNIQUE constraints → separate indexes
-  - Added INDEX ASYNC for better DSQL performance
-- ✅ Created migration notes (`docs/dsql-migration-guide.md`)
+- DSQL-compatible schema (`schema/dsql/v12/temporal/schema.sql`)
+- BYTEA → UUID conversion for composite primary keys
+- BIGSERIAL → BIGINT with Snowflake ID generation
+- CHECK constraints removed (application-level validation)
+- INDEX ASYNC for non-blocking index creation
 
 #### Persistence Layer
-- ✅ Implemented ID generation service (`common/persistence/sql/sqlplugin/idgenerator.go`)
-  - Snowflake-style distributed ID generator with thread-safe implementation
-  - Random ID generator fallback
-  - Hostname-based node ID assignment
-  - Comprehensive unit tests with concurrency validation
-- ✅ Created DSQL plugin (`common/persistence/sql/sqlplugin/dsql/plugin.go`)
-  - **FIRST-CLASS PLUGIN IMPLEMENTATION** - No longer an alias to PostgreSQL
-  - Delegates to PostgreSQL functionality while providing DSQL-specific error handling
-  - Custom error handling for DSQL serialization conflicts
-  - Connection error detection patterns
-  - Proper plugin registration using `sql.RegisterPlugin`
-- ✅ **DSQL Optimistic Concurrency Control** (`dsql-locking` branch - commit 466d3a651)
-  - Implemented CAS (Compare-And-Swap) updates for DSQL's optimistic locking
-  - Comprehensive retry logic for serialization conflicts with exponential backoff
-  - DSQL-specific error classification and handling
-  - Metrics collection for DSQL operations (conflict rates, retry counts, latency)
-  - Extensive test coverage for locking scenarios and transaction retries
-  - Production-ready implementation for high-throughput Temporal workloads
-- ✅ Unit tests for ID generation (`common/persistence/sql/sqlplugin/idgenerator_test.go`)
-  - All tests passing including concurrency tests
-  - Validates ID uniqueness, monotonicity, and thread safety
+- First-class DSQL plugin (`common/persistence/sql/sqlplugin/dsql/`)
+- Optimistic Concurrency Control with retry logic
+- Compare-And-Swap (CAS) updates for shard management
+- FOR UPDATE on single table only (DSQL limitation)
+- FOR SHARE delegated to FOR UPDATE
 
-#### Configuration
-- ✅ Created DSQL configuration examples:
-  - `config/development-dsql.yaml` - Main configuration
-  - `config/dynamicconfig/development-dsql.yaml` - Dynamic config with DSQL optimizations
+#### IAM Authentication
+- Token-refreshing driver with automatic credential refresh
+- Token cache with expiry management
+- Connection rate limiting (local and distributed)
 
-#### Code Quality
-- ✅ All DSQL-specific code passes `go vet` validation
-- ✅ Unit tests pass for ID generation components
-- ✅ Thread-safe implementation verified through concurrent testing
-- ✅ DSQL-specific code passes linting (remaining issues are in unrelated files or minor style suggestions)
+#### Connection Management - Reservoir Mode (Recommended)
+- **Connection Reservoir** (`driver/reservoir.go`) - Channel-based buffer of pre-created connections
+- **Continuous Refiller** (`driver/reservoir_refiller.go`) - Background goroutine that fills reservoir
+- **Proactive Expiry Scanner** - Evicts connections before they expire
+- **Guard Window** - Discards connections too close to expiry
+- **Distributed Connection Leasing** - DynamoDB-backed global connection count limiting
 
-### Pending Tasks
-
-#### Testing & Validation
-- ✅ Run `make lint-code` to verify code style compliance (DSQL code clean)
-- ✅ Run unit tests: `make unit-test` (DSQL tests passing)
-- ✅ **DSQL Plugin First-Class Implementation** - No longer alias-based, resolves initialization conflicts
-- ✅ **Docker Image Testing** - Minimal testing passes with new plugin architecture
-- ✅ **Build Verification** - `go build ./...` passes successfully (2025-01-06)
-- ✅ **DSQL Unit Tests** - All DSQL-specific tests pass including locking mechanisms (2025-01-06)
-- ✅ **Code Quality** - `go vet` passes with no issues (2025-01-06)
-- ⏳ Create integration tests for DSQL persistence layer
-- ⏳ Test schema migration from PostgreSQL to DSQL
-- ⏳ Performance testing under load (10× baseline)
-
-#### Documentation
-- ✅ Updated operator documentation with DSQL setup instructions
-- ✅ Created comprehensive migration guide (`docs/dsql/migration-guide.md`)
-- ✅ Documented DSQL-specific implementation details (`docs/dsql/implementation.md`)
-- ✅ Created DSQL metrics documentation (`docs/dsql/metrics.md`)
-- ✅ Created DSQL overview (`docs/dsql/overview.md`)
-- ✅ Updated all DSQL documentation for accuracy and consistency
+#### Connection Management - Legacy Mode
+- Pool Warmup - Sequential connection creation at startup
+- Pool Keeper - Background maintenance for connection replacement
 
 #### Observability
-- ✅ **DSQL-specific metrics implementation** (`dsql-locking` branch)
-  - Serialization conflict tracking and alerting
-  - Retry attempt counters and success rates
-  - Transaction latency and throughput metrics
-  - Connection pool utilization monitoring
-- ✅ **Connection closure metrics** (2026-01-21)
-  - `dsql_db_closed_max_lifetime_total` - Tracks MaxConnLifetime closures
-  - `dsql_db_closed_max_idle_time_total` - Tracks MaxConnIdleTime closures (should be 0)
-  - `dsql_db_closed_max_idle_total` - Tracks MaxIdleConns closures
-- ⏳ Create dashboards for DSQL health monitoring
-- ⏳ Define alerts for DSQL connection issues and serialization conflicts
+- DSQL-specific metrics (conflicts, retries, latency)
+- Reservoir metrics (checkouts, empty events, discards, refills)
+- Connection pool metrics (open, idle, in-use)
+
+#### Documentation
+- `docs/dsql/overview.md` - High-level overview
+- `docs/dsql/implementation.md` - Technical implementation details
+- `docs/dsql/reservoir-design.md` - Reservoir architecture and configuration
+- `docs/dsql/metrics.md` - Metrics reference
+- `docs/dsql/migration-guide.md` - Migration instructions
 
 #### Tooling
-- ⏳ Add `make` targets for DSQL schema management
-- ⏳ Create migration scripts for PostgreSQL → DSQL
-- ⏳ Update deployment templates with DSQL configuration
-
-### Open Questions & Investigations
-
-1. **ID Generation Performance**: Need to benchmark Snowflake vs Random ID generation under production load
-2. **✅ Serialization Conflict Handling**: **COMPLETED** - Implemented comprehensive retry strategy with exponential backoff
-3. **✅ Connection Pooling**: **COMPLETED** - Pool pre-warming with jittered lifecycle management
-   - Pool defaults: MaxConns=100, MaxIdleConns=100, MaxConnLifetime=0, MaxConnIdleTime=0
-   - Pre-warming creates all connections at startup (sequential, rate-limited)
-   - ConnectionRefresher manages lifecycle with jitter (15 min ± 2 min) to avoid thundering herd
-   - Connection closure metrics for monitoring pool health
-4. **Multi-Region Support**: Plan for DSQL's multi-region capabilities (future enhancement)
-5. **Transaction Size Limits**: Verify DSQL transaction size limits align with Temporal's requirements
-6. **Index Performance**: Validate async index creation performance and monitoring
-7. **🔐 Security Enhancement**: **Use AWS Secrets Manager for DSQL credentials** instead of local files in production
-   - Store database passwords in AWS Secrets Manager
-   - Configure IAM roles for service authentication
-   - Enable automatic secret rotation
-   - Integrate with Temporal's secret management capabilities
-8. **✅ Distributed Connection Rate Limiting**: **IMPLEMENTED** (`dsql-global-rate-limiter` branch)
-   - DynamoDB-backed distributed rate limiter for cluster-wide coordination
-   - Eliminates need for manual rate limit partitioning across service instances
-   - Automatically coordinates across all Temporal services sharing a DSQL cluster
-   - Per-second atomic counters with conditional updates
-   - Graceful fallback to local rate limiting if DynamoDB unavailable
-   - Configuration via environment variables:
-     - `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED=true` - Enable distributed mode
-     - `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE=<table-name>` - DynamoDB table
-     - `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT=100` - Cluster-wide limit (default: 100)
-   - **Important**: Only applies to NEW connection establishment, not queries
-9. **✅ Connection Pool Pre-Warming**: **IMPLEMENTED** (2026-01-21)
-   - Pool warms to 100 connections at startup (sequential, rate-limited)
-   - `MaxConnIdleTime=0` prevents pool decay - connections stay open indefinitely
-   - `MaxConnLifetime=55m` ensures connections refresh before DSQL's 60m limit
-   - Connection closure metrics track pool health (`dsql_db_closed_max_lifetime_total`, etc.)
-   - See `docs/dsql/implementation.md` for details
+- `tools/poolsim/` - Discrete event simulator for reservoir behavior validation
+- `tools/dsql/` - DSQL schema management tool
 
 ### Known Constraints
 
-1. **BIGSERIAL Not Supported**: Application must generate IDs (✅ implemented via Snowflake algorithm)
-2. **CHECK Constraints Not Supported**: Application must validate constraints (✅ implemented)
-3. **Complex DEFAULT Values Not Supported**: Application must set defaults (✅ implemented)
-4. **Foreign Key Constraints Not Enforced**: JOINs work but referential integrity is application-managed
-5. **✅ Optimistic Concurrency Control**: **ADDRESSED** - Comprehensive retry logic implemented for DSQL's OCC model
-6. **✅ Connection Pool Stability**: **ADDRESSED** - Pool pre-warming and MaxConnIdleTime=0 prevent pool decay
+1. **BIGSERIAL Not Supported**: Application generates IDs via Snowflake algorithm
+2. **CHECK Constraints Not Supported**: Application-level validation
+3. **FOR SHARE Not Supported**: Delegated to FOR UPDATE
+4. **FOR UPDATE on JOINs Not Supported**: Split into separate queries
+5. **Connection Rate Limit**: 100 connections/second cluster-wide
+6. **Connection Limit**: 10,000 connections per cluster
 
-### Next Agent Actions
+### Recommended Configuration
 
-**DSQL Implementation with Optimistic Concurrency Control Complete! ✅**
+**Reservoir Mode** (recommended for production):
+```bash
+export DSQL_RESERVOIR_ENABLED=true
+export DSQL_RESERVOIR_TARGET_READY=50
+export DSQL_RESERVOIR_BASE_LIFETIME=11m
+export DSQL_RESERVOIR_LIFETIME_JITTER=2m
+export DSQL_RESERVOIR_GUARD_WINDOW=45s
+```
 
-The Aurora DSQL persistence layer implementation is now production-ready:
+**Distributed Connection Leasing** (for multi-service deployments):
+```bash
+export DSQL_DISTRIBUTED_CONN_LEASE_ENABLED=true
+export DSQL_DISTRIBUTED_CONN_LEASE_TABLE=temporal-dsql-conn-lease
+export DSQL_DISTRIBUTED_CONN_LIMIT=10000
+```
 
-1. **Schema Compatibility**: ✅ Complete - DSQL-compatible schema with all necessary modifications
-2. **Persistence Layer**: ✅ Complete - ID generation service and DSQL plugin with full test coverage
-3. **Optimistic Concurrency Control**: ✅ Complete - Comprehensive retry logic and conflict handling
-4. **Configuration**: ✅ Complete - Development configuration files for both static and dynamic config
-5. **Code Quality**: ✅ Complete - All DSQL code passes linting and extensive unit tests
-6. **Documentation**: ✅ Complete - Comprehensive migration notes and implementation tracking
-7. **Observability**: ✅ Complete - Metrics collection for DSQL-specific operations
+### Validation Results
 
-**🚀 Recent Completion (`dsql-locking` branch):**
-- **CAS Updates**: Compare-and-swap operations for optimistic locking
-- **Retry Logic**: Exponential backoff with jitter for serialization conflicts
-- **Error Handling**: DSQL-specific error classification and recovery
-- **Metrics**: Comprehensive monitoring for conflict rates and performance
-- **Test Coverage**: Extensive testing for concurrent scenarios and edge cases
-- **✅ Build & Test Verification (2025-01-06)**: All builds pass, unit tests pass, code quality verified
-- **✅ Recent Changes Verified (2025-01-06)**: Minor updates to execution.go, shard.go, and for_share_safety_test.go - all tests pass
+- **400 WPS benchmark**: Validated with 100% workflow completion
+- **Checkout latency**: Sub-millisecond (p99 < 1ms)
+- **Zero empty events**: Reservoir always has connections available
+- **Rate limit compliance**: Never exceeds 100 connections/second
 
-**🔧 Connection Rate Limiting Fix (2026-01-19):**
-- **Root Cause**: 100 WPS benchmark failures traced to DSQL connection rate limit (`SQLSTATE 53400`)
-- **Problem**: Rate limiter was only applied at initial pool creation, not during pool growth
-- **Fix**: Integrated rate limiter into `tokenRefreshingDriver.Open()` method
-- **Files Changed**:
-  - `common/persistence/sql/sqlplugin/dsql/driver/token_refreshing_driver.go` - Added `RateLimiter` interface and rate limiting in `Open()`
-  - `common/persistence/sql/sqlplugin/dsql/plugin.go` - Pass rate limiter to driver registration
-  - `common/persistence/sql/sqlplugin/dsql/driver/token_refreshing_driver_test.go` - New test file with rate limiter tests
-- **Result**: ALL connection attempts (including pool growth) now respect DSQL's cluster-wide rate limits
-- **✅ Benchmark Validated (2026-01-19)**: 100 WPS benchmark completed with 100% workflow success (28,348/28,348)
+---
 
-**📊 Benchmark Results (2026-01-19):**
-| Metric | Value |
-|--------|-------|
-| Workflows Started | 28,348 |
-| Workflows Completed | 28,348 (100%) |
-| Actual Rate | 91.5 WPS |
-| P50 Latency | 239 ms |
-| P95 Latency | 3,700 ms |
-| P99 Latency | 11,456 ms |
+## Documentation
 
-**🌐 Distributed Rate Limiter (2026-01-19):** (`dsql-global-rate-limiter` branch)
-- **Purpose**: Coordinate DSQL connection rate limiting across all Temporal service instances
-- **Mechanism**: DynamoDB-backed per-second counters with atomic conditional updates
-- **Scope**: Only applies to NEW connection establishment (TCP/TLS + IAM auth), not queries
-- **Files Added**:
-  - `common/persistence/sql/sqlplugin/dsql/distributed_rate_limiter.go` - Core implementation
-  - `common/persistence/sql/sqlplugin/dsql/distributed_rate_limiter_test.go` - Comprehensive tests
-- **Files Modified**:
-  - `common/persistence/sql/sqlplugin/dsql/plugin.go` - Integration with plugin initialization
-  - `go.mod` / `go.sum` - Added DynamoDB SDK dependency
-- **DynamoDB Table Schema**:
-  - Partition key: `pk` (String) - Format: `dsqlconnect#<endpoint>#<unix_second>`
-  - TTL attribute: `ttl_epoch` (Number) - Auto-cleanup after 3 minutes
-- **Configuration**:
-  - `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED=true` - Enable distributed mode
-  - `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE=<table-name>` - DynamoDB table name
-  - `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT=100` - Cluster-wide limit per second
-  - `DSQL_DISTRIBUTED_RATE_LIMITER_MAX_WAIT=30s` - Max wait time for permit
-
-**🔥 Connection Pool Pre-Warming (2026-01-21):**
-- **Purpose**: Eliminate connection creation under load by pre-warming pool at startup
-- **Pool Defaults** (in `session/session.go`):
-  - `MaxConns = 100` - Maximum open connections per pool
-  - `MaxIdleConns = 100` - **MUST equal MaxConns** to prevent idle closure
-  - `MaxConnLifetime = 0` - **Disabled** (ConnectionRefresher manages lifecycle)
-  - `MaxConnIdleTime = 0` - **CRITICAL: Disabled to prevent pool decay**
-- **Files Added**:
-  - `common/persistence/sql/sqlplugin/dsql/pool_warmup.go` - Sequential warmup with retry logic
-  - `common/persistence/sql/sqlplugin/dsql/connection_refresher.go` - Jittered connection lifecycle management
-- **Files Modified**:
-  - `common/persistence/sql/sqlplugin/dsql/session/session.go` - Updated defaults
-  - `common/persistence/sql/sqlplugin/dsql/metrics.go` - Added closure metrics
-  - `common/persistence/sql/sqlplugin/dsql/plugin.go` - Warmup and refresher integration
-- **New Metrics**:
-  - `dsql_db_closed_max_lifetime_total` - Connections closed due to MaxConnLifetime
-  - `dsql_db_closed_max_idle_time_total` - Connections closed due to MaxConnIdleTime (should be 0)
-  - `dsql_db_closed_max_idle_total` - Connections closed due to MaxIdleConns exceeded
-- **Startup Logs**:
-  - `"Starting DSQL pool warmup"` with `target_connections=100`
-  - `"DSQL pool warmup complete"` with `connections_created=99`, `connections_failed=0`
-  - `"DSQL connection refresher started"` with refresh interval and jitter config
-
-**🔄 Connection Lifecycle Management (2026-01-23):**
-- **Problem**: All connections created at startup hit MaxConnLifetime at the same time → thundering herd
-- **Solution**: `ConnectionRefresher` manages connection lifecycle with jitter
-- **Configuration** (in `connection_refresher.go`):
-  - `RefreshInterval = 15 minutes` - How often connections are refreshed
-  - `RefreshJitter = 120 seconds` - Random jitter added to each connection (±2 min)
-  - `CheckInterval = 30 seconds` - How often the refresher checks for stale connections
-  - `MaxRefreshesPerCheck = 5` - Rate limit on concurrent refreshes
-- **How it works**:
-  1. Pool warmup creates all connections at startup
-  2. Each connection is tracked with a random refresh time (15 min ± 2 min jitter)
-  3. Background goroutine checks every 30s for connections due for refresh
-  4. Stale connections are replaced one-by-one (max 5 per check cycle)
-  5. New connections get fresh IAM tokens and new jittered refresh times
-- **Benefits**:
-  - No thundering herd when connections age out
-  - Connections refresh gradually over a 4-minute window (13-17 min)
-  - Pool stays at max size throughout the refresh cycle
-  - Each new connection gets a fresh IAM token
-
-**🔐 Security Recommendations for Production:**
-- **Use AWS Secrets Manager** for database credentials instead of local files
-- Configure IAM roles for DSQL authentication where possible
-- Enable automatic secret rotation
-- Implement least-privilege access policies
-- Use VPC endpoints for secure service communication
-
-**Ready for Production Deployment:**
-- ✅ Integration testing with actual DSQL cluster - PASSED
-- ✅ Performance benchmarking under production load - 400 WPS validated
-- Production configuration and deployment
-- Monitoring dashboard setup and alerting
+| Document | Description |
+|----------|-------------|
+| `docs/dsql/overview.md` | High-level overview of DSQL support |
+| `docs/dsql/implementation.md` | Technical implementation details |
+| `docs/dsql/reservoir-design.md` | Reservoir architecture and configuration |
+| `docs/dsql/metrics.md` | Metrics reference |
+| `docs/dsql/migration-guide.md` | Migration from PostgreSQL to DSQL |
+| `tools/poolsim/README.md` | Pool simulator documentation |

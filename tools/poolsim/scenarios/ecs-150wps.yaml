@@ -1,6 +1,6 @@
 # ECS 150 WPS Configuration
 #
-# Simulates a production ECS deployment for 150 WPS workloads.
+# Simulates a production ECS deployment for 150 WPS workloads with reservoir mode.
 #
 # Services:
 # - 8 History × 100 connections = 800
@@ -21,7 +21,8 @@ limiterPerSec: 100
 
 assertMaxConnectsPerSec: 100
 assertConvergeWithin: 60s
-assertMaxClosurePerSec: 100
+assertStableFor: 5s
+assertZeroEmptyEvents: true
 
 scenario:
   kind: cold_start
@@ -29,184 +30,144 @@ scenario:
 services:
   # History (8 replicas)
   - name: history-1
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 0ms
 
   - name: history-2
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 50ms
 
   - name: history-3
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 100ms
 
   - name: history-4
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 150ms
 
   - name: history-5
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 200ms
 
   - name: history-6
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 250ms
 
   - name: history-7
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 300ms
 
   - name: history-8
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 350ms
 
   # Matching (6 replicas)
   - name: matching-1
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 400ms
 
   - name: matching-2
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 450ms
 
   - name: matching-3
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 500ms
 
   - name: matching-4
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 550ms
 
   - name: matching-5
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 600ms
 
   - name: matching-6
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 650ms
 
   # Frontend (4 replicas)
   - name: frontend-1
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 700ms
 
   - name: frontend-2
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 750ms
 
   - name: frontend-3
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 800ms
 
   - name: frontend-4
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 850ms
 
   # Worker (2 replicas)
   - name: worker-1
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 900ms
 
   - name: worker-2
-    targetOpen: 100
-    maxOpen: 100
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 100
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 950ms

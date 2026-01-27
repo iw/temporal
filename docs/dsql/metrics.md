@@ -65,6 +65,92 @@ These metrics track WHY connections are being closed, helping diagnose pool deca
 
 Pool metrics are sampled every 15 seconds by a background collector.
 
+## Reservoir Metrics
+
+When reservoir mode is enabled (`DSQL_RESERVOIR_ENABLED=true`), these additional metrics are available:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `dsql_reservoir_size` | Gauge | `service` | Current reservoir size |
+| `dsql_reservoir_target` | Gauge | `service` | Target reservoir size |
+| `dsql_reservoir_checkouts_total` | Counter | `service` | Successful checkouts from reservoir |
+| `dsql_reservoir_empty_total` | Counter | `service` | Checkout attempts when reservoir is empty |
+| `dsql_reservoir_discards_total` | Counter | `service`, `reason` | Discarded connections |
+| `dsql_reservoir_refills_total` | Counter | `service` | Connections created by refiller |
+| `dsql_reservoir_refill_failures_total` | Counter | `service`, `reason` | Failed connection creates |
+
+### Discard Reasons
+
+The `reason` label on `dsql_reservoir_discards_total` can have these values:
+
+| Value | Description |
+|-------|-------------|
+| `insufficient_remaining_lifetime` | Connection too close to expiry (within guard window) |
+| `expired_on_checkout` | Connection already expired when checked out |
+| `expired_on_return` | Connection expired while in use |
+| `expired_on_wait` | Connection expired during brief wait |
+| `reservoir_full` | Reservoir at capacity, connection discarded |
+
+### Refill Failure Reasons
+
+The `reason` label on `dsql_reservoir_refill_failures_total` can have these values:
+
+| Value | Description |
+|-------|-------------|
+| `lease_acquire` | Failed to acquire global connection lease |
+| `rate_limit` | Rate limiter timeout |
+| `token_provider` | Failed to get IAM token |
+| `dsn_inject` | Failed to inject token into DSN |
+| `connection_open` | Failed to open physical connection |
+
+### Reservoir Health Indicators
+
+```promql
+# Reservoir fill ratio (should be close to 1.0)
+dsql_reservoir_size / dsql_reservoir_target
+
+# Empty reservoir rate (should be 0 in steady state)
+rate(dsql_reservoir_empty_total[5m])
+
+# Discard rate by reason
+sum by (reason) (rate(dsql_reservoir_discards_total[5m]))
+
+# Refill success rate
+rate(dsql_reservoir_refills_total[5m]) / 
+(rate(dsql_reservoir_refills_total[5m]) + rate(dsql_reservoir_refill_failures_total[5m]))
+```
+
+### Reservoir Alerting
+
+```yaml
+# Reservoir below target
+- alert: DSQLReservoirLow
+  expr: dsql_reservoir_size / dsql_reservoir_target < 0.5
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "DSQL reservoir below 50% capacity"
+
+# Reservoir empty events
+- alert: DSQLReservoirEmpty
+  expr: rate(dsql_reservoir_empty_total[5m]) > 0
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: "DSQL reservoir experiencing empty events"
+
+# High discard rate
+- alert: DSQLReservoirHighDiscards
+  expr: rate(dsql_reservoir_discards_total[5m]) > 1
+  for: 5m
+  labels:
+    severity: info
+  annotations:
+    summary: "DSQL reservoir discarding connections"
+```
+
 ## Derived Metrics
 
 ### Pool Saturation

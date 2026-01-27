@@ -27,6 +27,12 @@ This document covers the technical implementation of Aurora DSQL support in Temp
 - [Pool Metrics Collection](#pool-metrics-collection)
 - [Connection Pool Pre-Warming](#connection-pool-pre-warming)
 - [Pool Keeper](#pool-keeper)
+- [Connection Reservoir](#connection-reservoir)
+  - [Reservoir Architecture](#reservoir-architecture)
+  - [Reservoir Configuration](#reservoir-configuration)
+  - [Reservoir Driver](#reservoir-driver)
+  - [Reservoir Refiller](#reservoir-refiller)
+  - [Distributed Connection Leasing](#distributed-connection-leasing)
 - [Pool Simulator](#pool-simulator)
 - [Testing](#testing)
 
@@ -47,32 +53,42 @@ common/persistence/sql/sqlplugin/dsql/
 ├── token_cache.go                 # IAM token caching
 ├── connection_rate_limiter.go     # Local (per-instance) rate limiting
 ├── distributed_rate_limiter.go    # DynamoDB-backed distributed rate limiting
+├── reservoir_config.go            # Reservoir configuration from environment
+├── conn_lease_config.go           # Connection lease configuration
+├── distributed_conn_lease.go      # DynamoDB-backed global connection count limiting
 ├── pool_warmup.go                 # Connection pool pre-warming at startup
 ├── pool_keeper.go                 # Background pool maintenance
 ├── uuid.go                        # UUID string conversion utilities
 ├── typeconv.go                    # DateTime conversion
 ├── driver/
 │   ├── token_refreshing.go        # Token-refreshing database driver
-│   └── connection_registry.go     # Connection tracking for lifecycle management
+│   ├── connection_registry.go     # Connection tracking for lifecycle management
+│   ├── reservoir.go               # Connection reservoir (channel-based buffer)
+│   ├── reservoir_driver.go        # Reservoir-backed driver implementation
+│   ├── reservoir_conn.go          # Connection wrapper for reservoir
+│   └── reservoir_refiller.go      # Background refiller goroutine
 └── session/
     └── session.go                 # Connection session management
 
-tools/poolsim/                     # Discrete event simulator for pool behavior
+tools/poolsim/                     # Discrete event simulator for reservoir behavior
 ├── main.go                        # Entry point and simulation runner
 ├── config.go                      # Configuration loading and defaults
-├── pool.go                        # Connection pool model
-├── warmup.go                      # Pool warmup simulation
-├── keeper.go                      # Pool keeper simulation
+├── reservoir.go                   # Connection reservoir model
+├── refiller.go                    # Continuous refiller simulation
 ├── workload.go                    # Database workload simulation
 ├── limiter.go                     # Rate limiter model
 ├── metrics.go                     # Metrics collection
 ├── assertions.go                  # Validation assertions
+├── scenario.go                    # Scenario configuration (cold_start, mass_drop, etc.)
+├── service.go                     # Service abstraction
 ├── sim.go                         # Discrete event simulation engine
 ├── README.md                      # Documentation
 └── scenarios/                     # Pre-configured test scenarios
     ├── local.yaml                 # Local development (200 connections)
     ├── ecs-150wps.yaml            # ECS 150 WPS (2,000 connections)
-    └── ecs-400wps.yaml            # ECS 400 WPS (22,000 connections)
+    ├── ecs-400wps.yaml            # ECS 400 WPS (22,000 connections)
+    ├── mass-drop.yaml             # Mass connection drop recovery
+    └── workload-test.yaml         # Workload simulation test
 
 schema/dsql/v12/temporal/
 └── schema.sql                     # DSQL-compatible schema
@@ -785,9 +801,299 @@ func (pk *PoolKeeper) tick(ctx context.Context) {
 DSQL pool keeper started  target_pool_size=100 tick_interval=1s max_conns_per_tick=1
 ```
 
+## Connection Reservoir
+
+The Connection Reservoir is an advanced connection management mode that addresses the fundamental mismatch between DSQL's cluster-wide connection rate limit (100 connections/second) and the bursty nature of connection pool refill when connections expire due to `MaxConnLifetime`.
+
+### Problem Statement
+
+When connections expire due to `MaxConnLifetime`, the pool needs to replace them. If many connections expire at once (burst expiry), the pool shrinks because the refill rate can't keep up with the rate limit. The reservoir solves this by maintaining a buffer of pre-created connections that can be instantly handed out without waiting for rate limiters.
+
+### Reservoir Architecture
+
+```
+                    Global Rate Limit (100/sec)
+                           │
+                           ▼
+┌──────────────────────────────────────────────────┐
+│              RESERVOIR (per service)             │
+│                                                  │
+│  Continuously filled by background refiller      │
+│  Maintains buffer of "ready" connections         │
+│                                                  │
+│  ┌─────────────────────────────────────────┐    │
+│  │  Channel buffer (capacity = targetReady) │    │
+│  │  [conn1] [conn2] [conn3] ... [connN]     │    │
+│  └─────────────────────────────────────────┘    │
+│                                                  │
+└──────────────────────────────────────────────────┘
+                           │
+                           ▼ (instant - no rate limit)
+┌──────────────────────────────────────────────────┐
+│              POOL (Go's database/sql)            │
+│                                                  │
+│  Calls driver.Open() when it needs a connection  │
+│  Driver returns connection from reservoir        │
+│  No waiting for rate limit                       │
+└──────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+#### Reservoir (`driver/reservoir.go`)
+
+The reservoir is a channel-based buffer of physical connections:
+
+```go
+type Reservoir struct {
+    ready       chan *PhysicalConn  // Buffered channel
+    guardWindow time.Duration       // Discard if remaining lifetime within this window
+    leaseRel    LeaseReleaser       // For releasing global leases
+    metrics     ReservoirMetrics
+}
+
+type PhysicalConn struct {
+    Conn      driver.Conn
+    CreatedAt time.Time     // When connection was established
+    Lifetime  time.Duration // Total lifetime (base + jitter)
+    LeaseID   string        // For global connection count tracking
+}
+```
+
+**Key Operations:**
+
+- `TryCheckout(now)` - Non-blocking checkout from channel
+- `WaitCheckout(timeout)` - Brief blocking wait for transient empty conditions
+- `Return(pc, now)` - Non-blocking return to channel (discard if full or expired)
+
+**Design Decisions:**
+
+1. **Channel-based**: Using a buffered channel provides natural FIFO ordering and thread-safe access without explicit locking for the hot path.
+
+2. **Guard Window**: Connections within `guardWindow` of expiry are discarded on checkout/return. This prevents handing out connections that will expire mid-transaction.
+
+3. **Non-blocking Return**: If the channel is full, returned connections are discarded. This prevents blocking the caller.
+
+4. **Age Tracking**: Connection age is tracked from creation time rather than using a fixed expiry time. This allows computing remaining lifetime at checkout, which is more accurate when connections sit in the reservoir for varying amounts of time.
+
+### Reservoir Configuration
+
+The reservoir is configured entirely through environment variables, allowing operators to tune behavior without code changes.
+
+#### Core Configuration
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `DSQL_RESERVOIR_ENABLED` | `false` | Boolean | Enable reservoir mode. When `false`, uses standard token-refreshing driver. |
+| `DSQL_RESERVOIR_TARGET_READY` | `maxOpen` | Integer | Target number of connections to maintain in the reservoir. |
+| `DSQL_RESERVOIR_LOW_WATERMARK` | `maxOpen` | Integer | Threshold below which the refiller uses aggressive pacing. |
+| `DSQL_RESERVOIR_BASE_LIFETIME` | `11m` | Duration | Base lifetime for connections before they are discarded. |
+| `DSQL_RESERVOIR_LIFETIME_JITTER` | `2m` | Duration | Random jitter added to each connection's lifetime. |
+| `DSQL_RESERVOIR_GUARD_WINDOW` | `45s` | Duration | Time before expiry when connections are considered too old. |
+
+#### Distributed Connection Lease Configuration
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `DSQL_DISTRIBUTED_CONN_LEASE_ENABLED` | `false` | Boolean | Enable DynamoDB-backed global connection count limiting. |
+| `DSQL_DISTRIBUTED_CONN_LEASE_TABLE` | - | String | DynamoDB table name for lease tracking. |
+| `DSQL_DISTRIBUTED_CONN_LIMIT` | `10000` | Integer | Maximum connections allowed cluster-wide. |
+
+#### Configuration Example
+
+```bash
+# Enable reservoir mode
+export DSQL_RESERVOIR_ENABLED=true
+export DSQL_RESERVOIR_TARGET_READY=50
+export DSQL_RESERVOIR_LOW_WATERMARK=50
+export DSQL_RESERVOIR_BASE_LIFETIME=11m
+export DSQL_RESERVOIR_LIFETIME_JITTER=2m
+export DSQL_RESERVOIR_GUARD_WINDOW=45s
+
+# Optional: Enable distributed connection leasing
+export DSQL_DISTRIBUTED_CONN_LEASE_ENABLED=true
+export DSQL_DISTRIBUTED_CONN_LEASE_TABLE=temporal-dsql-conn-lease
+export DSQL_DISTRIBUTED_CONN_LIMIT=10000
+```
+
+For detailed configuration guidance, see [Reservoir Design - Configuration](reservoir-design.md#configuration).
+
+### Reservoir Driver
+
+The reservoir driver implements `driver.Driver` and sources connections from the reservoir:
+
+```go
+func (d *reservoirDriver) Open(_ string) (driver.Conn, error) {
+    now := time.Now().UTC()
+    
+    // Try non-blocking first
+    if pc, ok := d.res.TryCheckout(now); ok {
+        return newReservoirConn(d.res, pc), nil
+    }
+    
+    // Brief wait for refiller to catch up (100ms default)
+    if pc, ok := d.res.WaitCheckout(d.emptyWaitTimeout); ok {
+        return newReservoirConn(d.res, pc), nil
+    }
+    
+    // Reservoir empty - return ErrBadConn to trigger retry
+    return nil, driver.ErrBadConn
+}
+```
+
+**Design Decisions:**
+
+1. **ErrBadConn on Empty**: When reservoir is empty, returning `driver.ErrBadConn` tells `database/sql` to retry. This is the standard mechanism for transient connection failures.
+
+2. **Brief Blocking Wait**: Before returning `ErrBadConn`, the driver waits briefly (100ms) for the refiller to catch up. This smooths out transient empty reservoir conditions.
+
+3. **DSN Ignored**: The DSN parameter is ignored because connections are pre-created by the refiller.
+
+### Reservoir Refiller
+
+The refiller is a background goroutine that continuously fills the reservoir:
+
+```go
+func (r *reservoirRefiller) loop() {
+    steadyInterval := r.steadyStateInterval()
+    
+    for {
+        ready := r.res.Len()
+        need := r.cfg.TargetReady - ready
+        
+        if need <= 0 {
+            // At target - check again after steady state interval
+            sleepOrStop(r.stopC, steadyInterval)
+            continue
+        }
+        
+        // Create one connection
+        r.openOne(ctx)
+        
+        // Calculate interval with smooth transition
+        interval := r.calculateRefillInterval(ready, WarmupInterval, steadyInterval)
+        sleepOrStop(r.stopC, interval)
+    }
+}
+```
+
+**Refiller Pacing:**
+
+The refiller uses two modes with smooth transition:
+
+1. **Warmup Mode** (below low watermark): Uses full rate limit budget with minimal delay (10ms) between attempts. The rate limiter controls actual pacing.
+
+2. **Steady State Mode** (at or above target): Uses minimal rate limit budget by pacing based on connection lifetime. Only creates connections as fast as they expire.
+
+3. **Transition Zone** (between low watermark and target): Smoothly interpolates between warmup and steady-state intervals.
+
+**Steady State Interval Calculation:**
+
+```go
+// With N connections and lifetime L, need to replace N/L connections per second.
+// Example: 50 connections with 11min lifetime = 50/(11*60) = 0.076/sec = 1 every ~13 seconds
+interval := time.Duration(float64(baseLifetime) / float64(targetReady))
+```
+
+### Distributed Connection Leasing
+
+The reservoir can optionally use DynamoDB-backed global connection count limiting to enforce DSQL's 10,000 connection limit across all services.
+
+**Configuration:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSQL_DISTRIBUTED_CONN_LEASE_ENABLED` | `false` | Enable global conn limiting |
+| `DSQL_DISTRIBUTED_CONN_LEASE_TABLE` | - | DynamoDB table name |
+| `DSQL_DISTRIBUTED_CONN_LIMIT` | `10000` | Global connection limit |
+
+**DynamoDB Schema:**
+
+| Item Type | Partition Key | Attributes |
+|-----------|---------------|------------|
+| Counter | `dsqllease_counter#<endpoint>` | `active` (count), `updated_ms` |
+| Lease | `dsqllease#<endpoint>#<leaseID>` | `ttl_epoch`, `service_name`, `created_ms` |
+
+**Operations:**
+
+- `Acquire(ctx)` - TransactWriteItems: increment counter (if < limit) + put lease item
+- `Release(ctx, leaseID)` - TransactWriteItems: delete lease item + decrement counter
+
+**Design Decisions:**
+
+1. **Two-Item Approach**: Counter item for fast limit checking, lease items for TTL cleanup. This allows atomic acquire/release while enabling automatic cleanup of crashed services.
+
+2. **TTL Cleanup**: Lease items have TTL (3 minutes). If a service crashes, its leases are automatically cleaned up.
+
+3. **Conditional Update**: Counter increment uses `ConditionExpression: active < limit` to enforce the global limit atomically.
+
+### Reservoir Connection Wrapper
+
+The `reservoirConn` wraps a physical connection and returns it to the reservoir on `Close()`:
+
+```go
+func (c *reservoirConn) Close() error {
+    if c.closed.Swap(true) {
+        return nil  // Already closed
+    }
+    if c.bad.Load() {
+        // Mark as expired to force discard
+        c.pc.Lifetime = 0
+    }
+    c.r.Return(c.pc, time.Now().UTC())
+    return nil
+}
+```
+
+**Design Decisions:**
+
+1. **Bad Connection Tracking**: If any operation returns `driver.ErrBadConn`, the `bad` flag is set. On `Close()`, bad connections are discarded rather than returned to reservoir.
+
+2. **Interface Forwarding**: The wrapper forwards all optional driver interfaces (`ConnBeginTx`, `ExecerContext`, `QueryerContext`, `Pinger`, `SessionResetter`, `Validator`) to the underlying connection.
+
+### Initial Fill Synchronization
+
+When reservoir mode is enabled, the plugin waits for the reservoir to reach the low watermark before returning the connection:
+
+```go
+// In plugin.go, after registering reservoir driver:
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+for res.Len() < cfg.LowWatermark {
+    select {
+    case <-ctx.Done():
+        logger.Warn("Reservoir initial fill timeout")
+        break
+    case <-time.After(100 * time.Millisecond):
+    }
+}
+```
+
+### Startup Logs
+
+On successful reservoir startup, you'll see:
+
+```
+Reservoir refiller started  target_ready=50 low_watermark=50 base_lifetime=11m0s steady_state_interval=13.2s warmup_interval=10ms
+Reservoir driver Open() - connection checked out  open_count=1 reservoir_ready=49
+```
+
+### When to Use Reservoir Mode
+
+**Use reservoir mode when:**
+- Running high-throughput workloads (>100 WPS)
+- Multiple services share a DSQL cluster
+- Connection expiry causes latency spikes
+- Pool shrinkage is observed during burst expiry
+
+**Stick with standard mode when:**
+- Running low-throughput workloads
+- Single service with dedicated DSQL cluster
+- Connection pool is stable without intervention
+
 ## Pool Simulator
 
-A discrete event simulator is available for validating pool behavior under various conditions without requiring a real DSQL cluster.
+A discrete event simulator is available for validating reservoir behavior under various conditions without requiring a real DSQL cluster.
 
 ### Running the Simulator
 
@@ -804,9 +1110,9 @@ go run ./tools/poolsim -config tools/poolsim/scenarios/local.yaml -out results.c
 
 ### What It Models
 
-- **Pool Warmup**: Staggered connection creation at startup
-- **Pool Keeper**: Edge-triggered maintenance with ratio-based batching
-- **MaxConnLifetime**: Go's `database/sql` closes connections after this duration
+- **Reservoir**: Channel-based buffer with guard window validation
+- **Continuous Refiller**: Back-to-back connection creation with rate limiter as only throttle
+- **Expiry Scanner**: Proactive eviction of expired/expiring connections
 - **Rate Limiting**: DSQL's cluster-wide 100 connections/second limit
 - **Workload Simulation**: Database queries consuming connections
 
@@ -817,14 +1123,14 @@ The simulator validates behavior with configurable assertions:
 | Assertion | Description |
 |-----------|-------------|
 | `assertMaxConnectsPerSec` | Global connection rate must not exceed 100/sec |
-| `assertConvergeWithin` | All pools must reach target within this duration |
-| `assertStableFor` | After reaching target, pools must stay stable |
-| `assertMaxClosurePerSec` | Detects thundering herd by limiting closure rate |
+| `assertConvergeWithin` | All reservoirs must reach target within this duration |
+| `assertStableFor` | After reaching target, reservoirs must stay stable |
+| `assertZeroEmptyEvents` | No checkout attempts should find empty reservoir |
 
 ### Pre-Configured Scenarios
 
-| Scenario | Pools | Connections | Use Case |
-|----------|-------|-------------|----------|
+| Scenario | Services | Connections | Use Case |
+|----------|----------|-------------|----------|
 | `local.yaml` | 4 | 200 | Local development |
 | `ecs-150wps.yaml` | 20 | 2,000 | ECS 150 WPS deployment |
 | `ecs-400wps.yaml` | 44 | 22,000 | ECS 400 WPS deployment |

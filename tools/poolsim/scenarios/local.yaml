@@ -1,6 +1,6 @@
 # Local Docker Compose Simulation
 #
-# Simulates a local development deployment with small pools.
+# Simulates a local development deployment with reservoir mode.
 #
 # Total: 200 connections across 4 services
 # Expected convergence: ~2 seconds
@@ -14,46 +14,38 @@ sampleEvery: 1s
 limiterPerSec: 100
 
 assertMaxConnectsPerSec: 100
-assertConvergeWithin: 60s    # Allow time for staggered warmup
+assertConvergeWithin: 60s
 assertStableFor: 5s
-assertMaxClosurePerSec: 100  # Allow for some clustering due to fast warmup
+assertZeroEmptyEvents: true
 
 scenario:
   kind: cold_start
 
 services:
   - name: history
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 30s       # Spread warmup over 30s to avoid thundering herd
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 0s
 
   - name: matching
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 30s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 100ms
 
   - name: frontend
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 30s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 200ms
 
   - name: worker
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 30s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 300ms

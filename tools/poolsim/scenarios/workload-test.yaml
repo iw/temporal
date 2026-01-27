@@ -1,11 +1,11 @@
 # Workload Simulation Test
 #
-# Tests pool behavior under simulated database workload.
+# Tests reservoir behavior under simulated database workload.
 # This models Temporal services making database queries.
 #
 # Scenario:
-# - Services start and warm up pools
-# - Workload starts after warmup
+# - Services start and fill reservoirs
+# - Workload starts after initial fill
 # - Each service maintains ~30 concurrent queries
 # - Queries hold connections for 10-20ms
 
@@ -19,19 +19,18 @@ limiterPerSec: 100
 
 assertMaxConnectsPerSec: 100
 assertConvergeWithin: 10s
-assertMaxClosurePerSec: 50
+assertStableFor: 5s
+assertZeroEmptyEvents: true
 
 scenario:
   kind: cold_start
 
 services:
   - name: history
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 0s
     workload:
       enabled: true
@@ -43,12 +42,10 @@ services:
       maxWait: 5s
 
   - name: matching
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 100ms
     workload:
       enabled: true
@@ -60,12 +57,10 @@ services:
       maxWait: 5s
 
   - name: frontend
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 200ms
     workload:
       enabled: true
@@ -77,12 +72,10 @@ services:
       maxWait: 5s
 
   - name: worker
-    targetOpen: 50
-    maxOpen: 50
-    maxConnLifetime: 10m
-    warmupStagger: 0s
-    keeperTick: 1s
-    maxConnsPerTick: 5
+    targetReady: 50
+    guardWindow: 45s
+    baseLifetime: 11m
+    jitter: 2m
     startDelay: 300ms
     workload:
       enabled: true

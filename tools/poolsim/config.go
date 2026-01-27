@@ -27,28 +27,21 @@ type Config struct {
 	AssertConvergeWithin    time.Duration `json:"assertConvergeWithin" yaml:"assertConvergeWithin"`
 	AssertStableFor         time.Duration `json:"assertStableFor" yaml:"assertStableFor"`
 	AssertMaxClosurePerSec  int           `json:"assertMaxClosurePerSec" yaml:"assertMaxClosurePerSec"`
+	AssertZeroEmptyEvents   bool          `json:"assertZeroEmptyEvents" yaml:"assertZeroEmptyEvents"`
 
 	Services []ServiceConfig `json:"services" yaml:"services"`
 	Scenario ScenarioConfig  `json:"scenario" yaml:"scenario"`
 }
 
-// ServiceConfig configures a single service's pool behavior.
+// ServiceConfig configures a single service's reservoir behavior.
 type ServiceConfig struct {
 	Name string `json:"name" yaml:"name"`
 
-	// Pool configuration
-	TargetOpen int `json:"targetOpen" yaml:"targetOpen"`
-	MaxOpen    int `json:"maxOpen" yaml:"maxOpen"`
-
-	// Connection lifecycle (matches session.go defaults)
-	MaxConnLifetime time.Duration `json:"maxConnLifetime" yaml:"maxConnLifetime"`
-
-	// Warmup configuration (matches pool_warmup.go)
-	WarmupStagger time.Duration `json:"warmupStagger" yaml:"warmupStagger"`
-
-	// Keeper configuration (matches pool_keeper.go)
-	KeeperTick      time.Duration `json:"keeperTick" yaml:"keeperTick"`
-	MaxConnsPerTick int           `json:"maxConnsPerTick" yaml:"maxConnsPerTick"`
+	// Reservoir configuration (matches reservoir_config.go)
+	TargetReady  int           `json:"targetReady" yaml:"targetReady"`   // Target reservoir size
+	GuardWindow  time.Duration `json:"guardWindow" yaml:"guardWindow"`   // Discard if remaining < this
+	BaseLifetime time.Duration `json:"baseLifetime" yaml:"baseLifetime"` // Base connection lifetime
+	Jitter       time.Duration `json:"jitter" yaml:"jitter"`             // Lifetime jitter
 
 	// Startup delay (staggered service startup)
 	StartDelay time.Duration `json:"startDelay" yaml:"startDelay"`
@@ -138,28 +131,24 @@ func applyDefaults(cfg *Config) {
 	for i := range cfg.Services {
 		s := &cfg.Services[i]
 
-		if s.MaxOpen == 0 {
-			s.MaxOpen = s.TargetOpen
+		// Default: reservoir target = 50 (typical pool size)
+		if s.TargetReady == 0 {
+			s.TargetReady = 50
 		}
 
-		// Default: session.DefaultMaxConnLifetime = 10 minutes
-		if s.MaxConnLifetime == 0 {
-			s.MaxConnLifetime = 10 * time.Minute
+		// Default: guard window = 45 seconds
+		if s.GuardWindow == 0 {
+			s.GuardWindow = 45 * time.Second
 		}
 
-		// Default: pool_warmup.go calculates based on pool size
-		if s.WarmupStagger == 0 {
-			s.WarmupStagger = calculateWarmupStagger(s.TargetOpen)
+		// Default: base lifetime = 11 minutes
+		if s.BaseLifetime == 0 {
+			s.BaseLifetime = 11 * time.Minute
 		}
 
-		// Default: pool_keeper.go tick interval
-		if s.KeeperTick == 0 {
-			s.KeeperTick = 1 * time.Second
-		}
-
-		// Default: pool_keeper.go calculates based on pool size
-		if s.MaxConnsPerTick == 0 {
-			s.MaxConnsPerTick = calculateMaxConnsPerTick(s.TargetOpen)
+		// Default: jitter = 2 minutes
+		if s.Jitter == 0 {
+			s.Jitter = 2 * time.Minute
 		}
 
 		// Workload defaults
@@ -178,58 +167,6 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
-// calculateWarmupStagger matches pool_warmup.go CalculateStaggerDuration
-func calculateWarmupStagger(poolSize int) time.Duration {
-	if poolSize <= 100 {
-		return 0
-	}
-	if poolSize <= 500 {
-		return 2 * time.Minute
-	}
-	// Large pools: scale based on rate limit (50% of 100/sec = 50/sec)
-	minSeconds := poolSize / 50
-	minutes := (minSeconds / 60) + 1
-	if minutes < 3 {
-		minutes = 3
-	}
-	return time.Duration(minutes) * time.Minute
-}
-
-// calculateMaxConnsPerTick matches pool_keeper.go DefaultPoolKeeperConfig.
-//
-// This implements ratio-based batching: the batch size scales with pool size
-// to handle peak expiry rates during connection lifecycle rotation.
-//
-// IMPORTANT: This is a LOCAL desire, not a guarantee. The global rate limiter
-// (100 conn/sec cluster-wide) is the HARD constraint. If multiple pools
-// compete for the rate limit budget, they back off and retry.
-//
-// Formula: MaxConnsPerTick = ceil(poolSize / staggerSeconds), capped at 10
-//
-// Examples:
-//   - 50 connections:  ceil(50/120)  = 1 per tick
-//   - 100 connections: ceil(100/120) = 1 per tick
-//   - 500 connections: ceil(500/120) = 5 per tick
-//   - 1000+ connections: capped at 10 per tick
-//
-// With a 2-minute (120s) stagger window and 1-second tick interval,
-// this ensures the keeper can refill at the peak expiry rate when
-// rate limit budget is available.
-func calculateMaxConnsPerTick(poolSize int) int {
-	// With 2-minute stagger and 1-second tick:
-	// Peak expiry rate = poolSize / 120
-	// MaxConnsPerTick = ceil(poolSize / 120), capped at 10
-	staggerSeconds := 120
-	maxConns := (poolSize + staggerSeconds - 1) / staggerSeconds
-	if maxConns < 1 {
-		maxConns = 1
-	}
-	if maxConns > 10 {
-		maxConns = 10
-	}
-	return maxConns
-}
-
 func validate(cfg *Config) error {
 	if len(cfg.Services) == 0 {
 		return fmt.Errorf("config: services must be non-empty")
@@ -242,11 +179,14 @@ func validate(cfg *Config) error {
 		if s.Name == "" {
 			return fmt.Errorf("config: each service needs a name")
 		}
-		if s.TargetOpen <= 0 || s.MaxOpen <= 0 {
-			return fmt.Errorf("config: service %s requires targetOpen/maxOpen > 0", s.Name)
+		if s.TargetReady <= 0 {
+			return fmt.Errorf("config: service %s requires targetReady > 0", s.Name)
 		}
-		if s.TargetOpen > s.MaxOpen {
-			return fmt.Errorf("config: service %s targetOpen > maxOpen", s.Name)
+		if s.BaseLifetime <= 0 {
+			return fmt.Errorf("config: service %s requires baseLifetime > 0", s.Name)
+		}
+		if s.GuardWindow >= s.BaseLifetime {
+			return fmt.Errorf("config: service %s guardWindow must be < baseLifetime", s.Name)
 		}
 	}
 
@@ -271,6 +211,7 @@ func validate(cfg *Config) error {
 }
 
 // DefaultConfig returns a default configuration for local testing.
+// Models 4 Temporal services with reservoir mode.
 func DefaultConfig() *Config {
 	cfg := &Config{
 		Seed:                    42,
@@ -280,50 +221,44 @@ func DefaultConfig() *Config {
 		LimiterPerSec:           100,
 		AssertMaxConnectsPerSec: 100,
 		AssertConvergeWithin:    60 * time.Second,
+		AssertStableFor:         5 * time.Second,
 		AssertMaxClosurePerSec:  100,
+		AssertZeroEmptyEvents:   true,
 		Scenario: ScenarioConfig{
 			Kind: "cold_start",
 		},
 		Services: []ServiceConfig{
 			{
-				Name:            "history",
-				TargetOpen:      50,
-				MaxOpen:         50,
-				MaxConnLifetime: 10 * time.Minute,
-				WarmupStagger:   0,
-				KeeperTick:      1 * time.Second,
-				MaxConnsPerTick: 5,
-				StartDelay:      0,
+				Name:         "history",
+				TargetReady:  50,
+				GuardWindow:  45 * time.Second,
+				BaseLifetime: 11 * time.Minute,
+				Jitter:       2 * time.Minute,
+				StartDelay:   0,
 			},
 			{
-				Name:            "matching",
-				TargetOpen:      50,
-				MaxOpen:         50,
-				MaxConnLifetime: 10 * time.Minute,
-				WarmupStagger:   0,
-				KeeperTick:      1 * time.Second,
-				MaxConnsPerTick: 5,
-				StartDelay:      100 * time.Millisecond,
+				Name:         "matching",
+				TargetReady:  50,
+				GuardWindow:  45 * time.Second,
+				BaseLifetime: 11 * time.Minute,
+				Jitter:       2 * time.Minute,
+				StartDelay:   100 * time.Millisecond,
 			},
 			{
-				Name:            "frontend",
-				TargetOpen:      50,
-				MaxOpen:         50,
-				MaxConnLifetime: 10 * time.Minute,
-				WarmupStagger:   0,
-				KeeperTick:      1 * time.Second,
-				MaxConnsPerTick: 5,
-				StartDelay:      200 * time.Millisecond,
+				Name:         "frontend",
+				TargetReady:  50,
+				GuardWindow:  45 * time.Second,
+				BaseLifetime: 11 * time.Minute,
+				Jitter:       2 * time.Minute,
+				StartDelay:   200 * time.Millisecond,
 			},
 			{
-				Name:            "worker",
-				TargetOpen:      50,
-				MaxOpen:         50,
-				MaxConnLifetime: 10 * time.Minute,
-				WarmupStagger:   0,
-				KeeperTick:      1 * time.Second,
-				MaxConnsPerTick: 5,
-				StartDelay:      300 * time.Millisecond,
+				Name:         "worker",
+				TargetReady:  50,
+				GuardWindow:  45 * time.Second,
+				BaseLifetime: 11 * time.Minute,
+				Jitter:       2 * time.Minute,
+				StartDelay:   300 * time.Millisecond,
 			},
 		},
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/heap"
+	"fmt"
 	"time"
 )
 
@@ -75,6 +76,8 @@ func (s *Sim) After(d time.Duration, name string, fn func()) {
 
 // Run executes the simulation until completion or end time.
 func (s *Sim) Run() {
+	eventCount := 0
+	lastReport := s.now
 	for s.q.Len() > 0 {
 		ev := heap.Pop(&s.q).(*Event)
 		if ev.At.After(s.end) {
@@ -82,5 +85,13 @@ func (s *Sim) Run() {
 		}
 		s.now = ev.At
 		ev.Run()
+		eventCount++
+
+		// Progress report every simulated minute
+		if s.now.Sub(lastReport) >= time.Minute {
+			fmt.Printf("  [sim] t=%s events=%d queue=%d\n", s.now.Format("15:04:05"), eventCount, s.q.Len())
+			lastReport = s.now
+		}
 	}
+	fmt.Printf("  [sim] total events=%d\n", eventCount)
 }
