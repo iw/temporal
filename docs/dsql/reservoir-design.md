@@ -228,7 +228,7 @@ func (r *Reservoir) ScanAndEvict(now time.Time) int {
 
 ## Global Connection Count Limiting
 
-DSQL has a hard limit of **10,000 concurrent connections per cluster**. When running multiple Temporal services (Frontend, History, Matching, Worker) across multiple instances, it's easy to exceed this limit without coordination. The distributed connection lease system provides cluster-wide coordination to prevent this.
+DSQL has a default limit of **10,000 concurrent connections per cluster** (can be raised via AWS support request). When running multiple Temporal services (Frontend, History, Matching, Worker) across multiple instances, it's easy to exceed this limit without coordination. The distributed connection lease system provides cluster-wide coordination to prevent this.
 
 ### Why Global Limiting is Needed
 
@@ -237,7 +237,7 @@ Consider a typical production deployment:
 - Each instance has 2 pools (default + visibility) × 50 connections = 100 connections per instance
 - Total: 40 × 100 = 4,000 connections
 
-Without coordination, scaling up or a burst of connection creation could easily exceed 10,000 connections. The lease system ensures the cluster-wide limit is respected.
+Without coordination, scaling up or a burst of connection creation could easily exceed the default 10,000 connection limit. The lease system ensures the cluster-wide limit is respected.
 
 ### How It Works
 

@@ -997,7 +997,7 @@ interval := time.Duration(float64(baseLifetime) / float64(targetReady))
 
 ### Distributed Connection Leasing
 
-The reservoir can optionally use DynamoDB-backed global connection count limiting to enforce DSQL's 10,000 connection limit across all services.
+The reservoir can optionally use DynamoDB-backed global connection count limiting to enforce DSQL's connection limit (default 10,000, can be raised) across all services.
 
 **Configuration:**
 

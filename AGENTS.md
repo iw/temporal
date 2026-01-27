@@ -101,7 +101,7 @@
 3. **FOR SHARE Not Supported**: Delegated to FOR UPDATE
 4. **FOR UPDATE on JOINs Not Supported**: Split into separate queries
 5. **Connection Rate Limit**: 100 connections/second cluster-wide
-6. **Connection Limit**: 10,000 connections per cluster
+6. **Connection Limit**: 10,000 connections per cluster (default, can be raised)
 
 ### Recommended Configuration
 
