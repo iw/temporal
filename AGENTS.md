@@ -72,7 +72,20 @@
 - **Continuous Refiller** (`driver/reservoir_refiller.go`) - Background goroutine that fills reservoir
 - **Proactive Expiry Scanner** - Evicts connections before they expire
 - **Guard Window** - Discards connections too close to expiry
-- **Distributed Connection Leasing** - DynamoDB-backed global connection count limiting
+- **In-Flight Semaphore** - Limits concurrent Open() calls to prevent handshake pile-ups (default: 8)
+- **Reservoir Empty Fix** - Returns `ErrReservoirEmpty` instead of `driver.ErrBadConn` to prevent cascading pool recreation
+
+#### Distributed Rate Limiting
+- **Token Bucket Rate Limiter** (recommended) - Uses DSQL's burst capacity (1000) with 100/sec sustained
+- **Per-Second Counter** (legacy) - Simple counter per second, no burst support
+- **Local Rate Limiter** - Per-instance rate limiting (no coordination)
+
+#### Distributed Connection Limiting
+- **Slot Block Manager** - Block-based allocation to avoid hot partition issues
+- Each service acquires blocks of 100 slots (configurable)
+- 100 blocks × 100 slots = 10,000 total slots
+- TTL-based crash recovery (blocks become available after TTL expires)
+- No hot partition: each block has its own DynamoDB partition key
 
 #### Connection Management - Legacy Mode
 - Pool Warmup - Sequential connection creation at startup
@@ -87,6 +100,7 @@
 - `docs/dsql/overview.md` - High-level overview
 - `docs/dsql/implementation.md` - Technical implementation details
 - `docs/dsql/reservoir-design.md` - Reservoir architecture and configuration
+- `docs/dsql/reservoir-empty-fix.md` - Fix for cascading pool recreation bug
 - `docs/dsql/metrics.md` - Metrics reference
 - `docs/dsql/migration-guide.md` - Migration instructions
 
@@ -112,13 +126,26 @@ export DSQL_RESERVOIR_TARGET_READY=50
 export DSQL_RESERVOIR_BASE_LIFETIME=11m
 export DSQL_RESERVOIR_LIFETIME_JITTER=2m
 export DSQL_RESERVOIR_GUARD_WINDOW=45s
+export DSQL_RESERVOIR_INFLIGHT_LIMIT=8  # Max concurrent Open() calls
 ```
 
-**Distributed Connection Leasing** (for multi-service deployments):
+**Distributed Rate Limiting with Token Bucket** (recommended):
+```bash
+export DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED=true
+export DSQL_DISTRIBUTED_RATE_LIMITER_TABLE=temporal-dsql-rate-limiter
+export DSQL_TOKEN_BUCKET_ENABLED=true
+export DSQL_TOKEN_BUCKET_RATE=100       # Tokens per second (DSQL sustained rate)
+export DSQL_TOKEN_BUCKET_CAPACITY=1000  # Bucket capacity (DSQL burst capacity)
+```
+
+**Distributed Connection Limiting with Slot Blocks** (for multi-service deployments):
 ```bash
 export DSQL_DISTRIBUTED_CONN_LEASE_ENABLED=true
 export DSQL_DISTRIBUTED_CONN_LEASE_TABLE=temporal-dsql-conn-lease
-export DSQL_DISTRIBUTED_CONN_LIMIT=10000
+export DSQL_SLOT_BLOCK_SIZE=100   # Slots per block
+export DSQL_SLOT_BLOCK_COUNT=100  # Total blocks (100 × 100 = 10k slots)
+export DSQL_SLOT_BLOCK_TTL=3m     # TTL for crash recovery
+export DSQL_SLOT_BLOCK_RENEW_INTERVAL=1m
 ```
 
 ### Validation Results
@@ -137,6 +164,7 @@ export DSQL_DISTRIBUTED_CONN_LIMIT=10000
 | `docs/dsql/overview.md` | High-level overview of DSQL support |
 | `docs/dsql/implementation.md` | Technical implementation details |
 | `docs/dsql/reservoir-design.md` | Reservoir architecture and configuration |
+| `docs/dsql/reservoir-empty-fix.md` | Fix for cascading pool recreation bug |
 | `docs/dsql/metrics.md` | Metrics reference |
 | `docs/dsql/migration-guide.md` | Migration from PostgreSQL to DSQL |
 | `tools/poolsim/README.md` | Pool simulator documentation |

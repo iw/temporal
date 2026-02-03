@@ -65,19 +65,23 @@ The DSQL schema includes support for:
 
 ### Connection Rate Limiting
 
-DSQL has a cluster-wide limit of 100 new connections per second. The plugin provides two rate limiting modes:
+DSQL has a cluster-wide limit of 100 new connections per second with a burst capacity of 1,000 connections. The plugin provides multiple rate limiting modes:
 
 #### Local Rate Limiting (Default)
 - Per-instance rate limiting using token bucket algorithm
 - Requires manual partitioning of the 100/sec budget across instances
 - Configurable via environment variables
 
-#### Distributed Rate Limiting (Recommended for Production)
+#### Token Bucket Rate Limiting (Recommended for Production)
 - DynamoDB-backed coordination across all service instances
-- Automatically enforces the cluster-wide 100/sec limit
-- No manual partitioning required - scales automatically with service count
-- Per-second atomic counters with conditional updates
-- Graceful fallback to local limiting if DynamoDB unavailable
+- Takes advantage of DSQL's burst capacity (1,000 connections)
+- Automatically enforces the cluster-wide 100/sec sustained rate
+- Single DynamoDB item per endpoint - no hot partition issues
+
+#### Per-Second Counter (Legacy)
+- DynamoDB-backed per-second counter
+- Does not support burst capacity
+- Simpler but less efficient than token bucket
 
 **Important**: Rate limiting only applies to NEW connection establishment (TCP/TLS handshake + IAM authentication), not to queries. Once a connection is in the pool, queries flow through without rate limiting.
 
@@ -89,7 +93,8 @@ For high-throughput workloads, the plugin provides an optional Connection Reserv
 - Background refiller continuously maintains the reservoir
 - Non-blocking `driver.Open()` for instant connection checkout
 - Automatic connection lifecycle management with jittered expiry
-- Optional DynamoDB-backed global connection count limiting
+- In-flight semaphore prevents handshake pile-ups during burst
+- Optional DynamoDB-backed global connection count limiting via slot blocks
 
 See [Reservoir Design](reservoir-design.md) for detailed documentation.
 

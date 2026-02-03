@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -17,6 +18,12 @@ const (
 
 	// ExpiryScanInterval is how often we scan for and evict expired connections.
 	ExpiryScanInterval = 1 * time.Second
+
+	// DefaultInflightLimit is the default max concurrent Open() calls per refiller.
+	// This prevents handshake pile-ups even when burst capacity is available.
+	// TCP/TLS handshakes take time; limiting concurrency prevents overwhelming
+	// the network stack and DSQL's connection handling.
+	DefaultInflightLimit = 8
 )
 
 type reservoirRefiller struct {
@@ -31,8 +38,13 @@ type reservoirRefiller struct {
 	logFunc       LogFunc
 	metrics       ReservoirMetrics
 
-	rng   *rand.Rand
-	stopC chan struct{}
+	// inflightSem limits concurrent connection Open() calls.
+	// This prevents handshake pile-ups even when rate limiter allows burst.
+	inflightSem chan struct{}
+
+	rng      *rand.Rand
+	stopC    chan struct{}
+	stopOnce sync.Once
 }
 
 func (r *reservoirRefiller) Start() {
@@ -46,14 +58,27 @@ func (r *reservoirRefiller) Start() {
 	if r.metrics == nil {
 		r.metrics = &noOpReservoirMetrics{}
 	}
+	// Initialize in-flight semaphore
+	inflightLimit := r.cfg.InflightLimit
+	if inflightLimit <= 0 {
+		inflightLimit = DefaultInflightLimit
+	}
+	r.inflightSem = make(chan struct{}, inflightLimit)
 	go r.loop()
 	go r.expiryScanner()
 }
 
+// Stop stops the refiller and expiry scanner goroutines.
+// It is safe to call Stop multiple times.
 func (r *reservoirRefiller) Stop() {
-	if r.stopC != nil {
-		close(r.stopC)
-	}
+	r.stopOnce.Do(func() {
+		if r.stopC != nil {
+			close(r.stopC)
+			if r.logFunc != nil {
+				r.logFunc("Reservoir refiller stopped")
+			}
+		}
+	})
 }
 
 func (r *reservoirRefiller) loop() {
@@ -133,6 +158,22 @@ func (r *reservoirRefiller) expiryScanner() {
 }
 
 func (r *reservoirRefiller) openOne(ctx context.Context) error {
+	// Acquire in-flight semaphore to limit concurrent Open() calls.
+	// This prevents handshake pile-ups even when rate limiter allows burst.
+	select {
+	case r.inflightSem <- struct{}{}:
+		// Acquired semaphore slot - record in-flight count
+		r.metrics.RecordRefillerInflight(len(r.inflightSem))
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.stopC:
+		return context.Canceled
+	}
+	defer func() {
+		<-r.inflightSem
+		r.metrics.RecordRefillerInflight(len(r.inflightSem))
+	}()
+
 	// Acquire global conn-count lease first.
 	leaseID := ""
 	if r.leaseManager != nil {

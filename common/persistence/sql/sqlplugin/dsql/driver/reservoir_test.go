@@ -55,6 +55,9 @@ func (m *mockReservoirMetrics) IncReservoirRefillFailures(reason string) {
 func (m *mockReservoirMetrics) RecordCheckoutLatency(d time.Duration) {
 	m.checkoutLatencies = append(m.checkoutLatencies, d)
 }
+func (m *mockReservoirMetrics) RecordRefillerInflight(count int) {
+	// No-op for tests
+}
 
 // TestPhysicalConn_ExpiresAt tests the ExpiresAt method
 func TestPhysicalConn_ExpiresAt(t *testing.T) {

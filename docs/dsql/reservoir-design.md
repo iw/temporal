@@ -228,7 +228,7 @@ func (r *Reservoir) ScanAndEvict(now time.Time) int {
 
 ## Global Connection Count Limiting
 
-DSQL has a default limit of **10,000 concurrent connections per cluster** (can be raised via AWS support request). When running multiple Temporal services (Frontend, History, Matching, Worker) across multiple instances, it's easy to exceed this limit without coordination. The distributed connection lease system provides cluster-wide coordination to prevent this.
+DSQL has a default limit of **10,000 concurrent connections per cluster** (can be raised via AWS support request). When running multiple Temporal services (Frontend, History, Matching, Worker) across multiple instances, it's easy to exceed this limit without coordination.
 
 ### Why Global Limiting is Needed
 
@@ -237,306 +237,219 @@ Consider a typical production deployment:
 - Each instance has 2 pools (default + visibility) × 50 connections = 100 connections per instance
 - Total: 40 × 100 = 4,000 connections
 
-Without coordination, scaling up or a burst of connection creation could easily exceed the default 10,000 connection limit. The lease system ensures the cluster-wide limit is respected.
+Without coordination, scaling up or a burst of connection creation could easily exceed the default 10,000 connection limit.
 
-### How It Works
+### Slot Block Manager (Recommended)
 
-The lease system uses a **two-item approach** in DynamoDB:
+The **Slot Block Manager** provides distributed connection limiting using a block-based allocation strategy that avoids hot partition issues in DynamoDB.
 
-1. **Counter Item**: Tracks the current total connection count across all services
-2. **Lease Items**: Individual records for each connection, enabling TTL-based cleanup
+Instead of incrementing a single counter per connection (which creates a hot partition), the Slot Block Manager:
+1. Pre-allocates **blocks** of connection slots (default: 100 slots per block)
+2. Each service acquires one or more blocks at startup
+3. Once a block is owned, connections can be created without DynamoDB calls
+4. TTL-based crash recovery ensures blocks are released if a service crashes
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     DynamoDB Table                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  Counter Item (1 per DSQL endpoint):                           │
+│  Block Items (100 blocks × 100 slots = 10,000 total slots):    │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │ pk: "dsqllease_counter#cluster.dsql.us-east-1.on.aws"   │   │
-│  │ active: 2847                                             │   │
-│  │ updated_ms: 1706284800000                                │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  Lease Items (1 per connection):                               │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ pk: "dsqllease#cluster...#a1b2c3d4e5f6..."              │   │
+│  │ pk: "connslots#cluster.dsql.us-east-1.on.aws#block-0"   │   │
+│  │ owner_id: "a1b2c3d4e5f6..."                             │   │
 │  │ ttl_epoch: 1706284980                                    │   │
+│  │ slots: 100                                               │   │
 │  │ service_name: "history"                                  │   │
-│  │ created_ms: 1706284800000                                │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │ pk: "dsqllease#cluster...#f6e5d4c3b2a1..."              │   │
+│  │ pk: "connslots#cluster.dsql.us-east-1.on.aws#block-1"   │   │
+│  │ owner_id: "f6e5d4c3b2a1..."                             │   │
 │  │ ttl_epoch: 1706284990                                    │   │
+│  │ slots: 100                                               │   │
 │  │ service_name: "matching"                                 │   │
-│  │ created_ms: 1706284810000                                │   │
 │  └─────────────────────────────────────────────────────────┘   │
-│  ... (one item per active connection)                          │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ pk: "connslots#cluster.dsql.us-east-1.on.aws#block-2"   │   │
+│  │ owner_id: ""  (unowned - available)                     │   │
+│  │ ttl_epoch: 0                                             │   │
+│  │ slots: 100                                               │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│  ... (100 blocks total)                                        │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### DynamoDB Schema
+#### Why Block-Based Allocation?
 
-| Item Type | Partition Key Format | Attributes |
-|-----------|---------------------|------------|
-| Counter | `dsqllease_counter#<endpoint>` | `active` (Number), `updated_ms` (Number) |
-| Lease | `dsqllease#<endpoint>#<leaseID>` | `ttl_epoch` (Number), `service_name` (String), `created_ms` (Number) |
+| Approach | DynamoDB Calls | Hot Partition | Crash Recovery |
+|----------|----------------|---------------|----------------|
+| Per-connection counter | 2 per connection | Yes (single item) | TTL on lease items |
+| **Slot blocks** | 1 per block at startup | No (100 partition keys) | TTL on blocks |
 
-**Key attributes:**
-- `active`: Current count of active connections (on counter item)
-- `ttl_epoch`: Unix timestamp for DynamoDB TTL auto-deletion (on lease items)
-- `service_name`: Which Temporal service owns this lease (for debugging)
-- `created_ms`: When the lease was created (for debugging)
+With slot blocks:
+- **No hot partition**: Each block has its own partition key
+- **Minimal DynamoDB calls**: Only at startup and for TTL renewal
+- **Fast local tracking**: Once blocks are owned, slot allocation is in-memory
 
-### Acquire Operation
+#### Configuration
 
-When the refiller wants to create a new connection, it first acquires a lease:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSQL_DISTRIBUTED_CONN_LEASE_ENABLED` | `false` | Enable slot block manager |
+| `DSQL_DISTRIBUTED_CONN_LEASE_TABLE` | - | DynamoDB table name (required if enabled) |
+| `DSQL_SLOT_BLOCK_SIZE` | `100` | Slots per block |
+| `DSQL_SLOT_BLOCK_COUNT` | `100` | Total number of blocks (100 × 100 = 10k slots) |
+| `DSQL_SLOT_BLOCK_TTL` | `3m` | TTL for crash recovery |
+| `DSQL_SLOT_BLOCK_RENEW_INTERVAL` | `1m` | How often to renew TTL |
 
-```go
-func (l *DistributedConnLeases) Acquire(ctx context.Context) (string, error) {
-    leaseID := generateRandomLeaseID()  // 32-char hex string
-    
-    // Atomic transaction: increment counter + create lease item
-    _, err := l.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-        TransactItems: []types.TransactWriteItem{
-            // 1. Increment counter (only if below limit)
-            {
-                Update: &types.Update{
-                    TableName: aws.String(l.table),
-                    Key: map[string]types.AttributeValue{
-                        "pk": &types.AttributeValueMemberS{Value: "dsqllease_counter#" + l.endpoint},
-                    },
-                    UpdateExpression: aws.String("SET active = if_not_exists(active, :zero) + :one, updated_ms = :nowms"),
-                    ConditionExpression: aws.String("attribute_not_exists(active) OR active < :limit"),
-                    ExpressionAttributeValues: map[string]types.AttributeValue{
-                        ":zero":  &types.AttributeValueMemberN{Value: "0"},
-                        ":one":   &types.AttributeValueMemberN{Value: "1"},
-                        ":limit": &types.AttributeValueMemberN{Value: "10000"},
-                        ":nowms": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixMilli())},
-                    },
-                },
-            },
-            // 2. Create lease item with TTL
-            {
-                Put: &types.Put{
-                    TableName: aws.String(l.table),
-                    Item: map[string]types.AttributeValue{
-                        "pk":           &types.AttributeValueMemberS{Value: "dsqllease#" + l.endpoint + "#" + leaseID},
-                        "ttl_epoch":    &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().Add(3*time.Minute).Unix())},
-                        "service_name": &types.AttributeValueMemberS{Value: l.serviceName},
-                        "created_ms":   &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixMilli())},
-                    },
-                },
-            },
-        },
-    })
-    
-    if err != nil {
-        return "", err  // Limit reached or DynamoDB error
-    }
-    return leaseID, nil
-}
-```
+#### How It Works
 
-**Key points:**
-- Uses `TransactWriteItems` for atomicity - both operations succeed or both fail
-- `ConditionExpression` ensures counter only increments if below limit
-- If limit is reached, the transaction fails with `TransactionCanceledException`
-- Lease ID is stored in `PhysicalConn.LeaseID` for later release
-
-### Release Operation
-
-When a connection is discarded (expired, bad, or reservoir full), the lease is released:
+1. **Startup**: Service calculates how many blocks it needs based on `DSQL_RESERVOIR_TARGET_READY`
+2. **Block Acquisition**: Tries to acquire blocks using conditional PutItem (only if unowned or TTL expired)
+3. **Slot Tracking**: Tracks used slots in-memory with atomic counter
+4. **TTL Renewal**: Background goroutine renews TTL on owned blocks every minute
+5. **Shutdown**: Releases blocks by clearing `owner_id`
 
 ```go
-func (l *DistributedConnLeases) Release(ctx context.Context, leaseID string) error {
-    // Atomic transaction: delete lease item + decrement counter
-    _, err := l.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-        TransactItems: []types.TransactWriteItem{
-            // 1. Delete lease item
-            {
-                Delete: &types.Delete{
-                    TableName: aws.String(l.table),
-                    Key: map[string]types.AttributeValue{
-                        "pk": &types.AttributeValueMemberS{Value: "dsqllease#" + l.endpoint + "#" + leaseID},
-                    },
-                },
-            },
-            // 2. Decrement counter
-            {
-                Update: &types.Update{
-                    TableName: aws.String(l.table),
-                    Key: map[string]types.AttributeValue{
-                        "pk": &types.AttributeValueMemberS{Value: "dsqllease_counter#" + l.endpoint},
-                    },
-                    UpdateExpression: aws.String("SET active = active - :one, updated_ms = :nowms"),
-                    ConditionExpression: aws.String("attribute_exists(active) AND active >= :one"),
-                    ExpressionAttributeValues: map[string]types.AttributeValue{
-                        ":one":   &types.AttributeValueMemberN{Value: "1"},
-                        ":nowms": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixMilli())},
-                    },
-                },
-            },
-        },
-    })
-    
-    return err  // Best-effort, errors are logged but not fatal
-}
+// Block acquisition condition
+ConditionExpression: "attribute_not_exists(pk) OR owner_id = :empty OR ttl_epoch < :now"
 ```
 
-**Key points:**
-- Release is best-effort - if it fails, TTL cleanup will eventually fix the counter
-- `ConditionExpression` prevents counter from going negative
-- Release is called from `Reservoir.discard()` when connections are discarded
+#### Failure Modes
 
-### TTL-Based Cleanup
+| Scenario | Behavior |
+|----------|----------|
+| DynamoDB unavailable at startup | Block acquisition fails, service starts without global limiting |
+| Service crash | Blocks become available after TTL expires (3 min) |
+| All blocks owned | New services cannot acquire slots, log warning |
+| TTL renewal fails | Block may be taken by another service after TTL expires |
 
-DynamoDB's TTL feature automatically deletes expired lease items. This handles crash recovery:
+#### Metrics
 
-1. Service crashes without releasing leases
-2. Lease items have `ttl_epoch` set to 3 minutes from creation
-3. DynamoDB automatically deletes expired items (within ~48 hours, typically much faster)
-4. Counter may temporarily be higher than actual connections
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dsql_slot_blocks_owned` | Gauge | Number of blocks owned by this service |
+| `dsql_slot_blocks_slots_used` | Gauge | Number of slots currently in use |
 
-**Important**: TTL cleanup only deletes lease items, not the counter. This means the counter can drift if services crash frequently. In practice, this is acceptable because:
-- TTL is short (3 minutes) so drift is bounded
-- Counter eventually self-corrects as leases expire
-- Operators can manually reset the counter if needed
+## Distributed Rate Limiting
 
-### Sequence Diagram: Lease Acquire
+DSQL has a **cluster-wide connection rate limit of 100 connections/second** with a **burst capacity of 1,000 connections**. The plugin provides two rate limiting modes to coordinate across service instances.
 
-```
-Refiller                    DynamoDB                         DSQL
-   │                           │                               │
-   │──TransactWriteItems──────>│                               │
-   │   (increment counter,     │                               │
-   │    create lease item)     │                               │
-   │                           │                               │
-   │<──Success (leaseID)───────│                               │
-   │                           │                               │
-   │──Wait on rate limiter─────────────────────────────────────│
-   │                           │                               │
-   │──Open connection──────────────────────────────────────────>│
-   │<──Connection established──────────────────────────────────│
-   │                           │                               │
-   │──Return(PhysicalConn{LeaseID: leaseID})──────────────────>│
-   │                           │                               │
-```
+### Token Bucket Rate Limiter (Recommended)
 
-### Sequence Diagram: Lease Release (on discard)
+The **Token Bucket Rate Limiter** uses DynamoDB to coordinate rate limiting across all service instances, taking advantage of DSQL's burst capacity.
 
 ```
-Reservoir                   DynamoDB
-   │                           │
-   │  (connection expired or   │
-   │   marked bad)             │
-   │                           │
-   │──Close physical conn──────│
-   │                           │
-   │──TransactWriteItems──────>│
-   │   (delete lease item,     │
-   │    decrement counter)     │
-   │                           │
-   │<──Success─────────────────│
-   │                           │
+┌─────────────────────────────────────────────────────────────────┐
+│                     Token Bucket Model                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Bucket (single DynamoDB item per endpoint):                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ pk: "dsql_connect_bucket#cluster.dsql.us-east-1.on.aws" │   │
+│  │ tokens_milli: 850000  (850 tokens × 1000)               │   │
+│  │ last_refill_ms: 1706284800000                           │   │
+│  │ rate_milli: 100000    (100 tokens/sec × 1000)           │   │
+│  │ capacity_milli: 1000000 (1000 tokens × 1000)            │   │
+│  │ ttl_epoch: 1706288400                                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  • Refills at 100 tokens/second (DSQL sustained rate)          │
+│  • Capacity of 1000 tokens (DSQL burst capacity)               │
+│  • Uses milli-tokens (×1000) to avoid floating point           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+#### Why Token Bucket?
+
+| Approach | Burst Support | Coordination | Complexity |
+|----------|---------------|--------------|------------|
+| Per-second counter | No | Yes | Simple |
+| **Token bucket** | Yes (1000) | Yes | Moderate |
+| Local rate limiter | No | No | Simple |
+
+The token bucket allows:
+- **Fast initial fill**: Use burst capacity (1000) for rapid startup
+- **Sustained rate**: Settle to 100/sec after burst exhausted
+- **Fair sharing**: All services draw from the same bucket
+
+#### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED` | `false` | Enable distributed rate limiting |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE` | - | DynamoDB table name |
+| `DSQL_TOKEN_BUCKET_ENABLED` | `false` | Use token bucket (vs per-second counter) |
+| `DSQL_TOKEN_BUCKET_RATE` | `100` | Tokens per second (DSQL sustained rate) |
+| `DSQL_TOKEN_BUCKET_CAPACITY` | `1000` | Bucket capacity (DSQL burst capacity) |
+| `DSQL_TOKEN_BUCKET_MAX_WAIT` | `30s` | Maximum wait time for a token |
+
+#### How It Works
+
+1. **Token Acquisition**: Atomic DynamoDB UpdateItem with condition
+2. **Refill Calculation**: `new_tokens = min(capacity, current + elapsed_ms × rate / 1000)`
+3. **Decrement**: Subtract 1 token on successful acquisition
+4. **Retry**: If bucket empty, wait and retry with backoff
+
+```go
+// Condition: after refill, tokens >= 1
+ConditionExpression: `
+    attribute_not_exists(pk) OR
+    (tokens_milli + elapsed_ms × rate_milli / 1000) >= 1000
+`
+```
+
+#### Logging
+
+The token bucket limiter logs:
+- **Debug**: Token acquired (only if wait > 10ms or retries > 1)
+- **Warn**: Token acquire failure or timeout
+
+### Per-Second Counter (Legacy)
+
+The legacy distributed rate limiter uses a simple per-second counter. It does not support burst capacity.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED` | `false` | Enable distributed rate limiting |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE` | - | DynamoDB table name |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT` | `100` | Connections per second |
+
+### Local Rate Limiter
+
+When distributed rate limiting is disabled, each service instance uses a local token bucket rate limiter. This requires manual partitioning of the 100/sec budget across instances.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSQL_CONNECTION_RATE_LIMIT` | `10` | Connections per second per instance |
+| `DSQL_CONNECTION_BURST_LIMIT` | `100` | Burst capacity per instance |
+
+## In-Flight Semaphore
+
+The refiller uses an **in-flight semaphore** to limit concurrent `Open()` calls. This prevents handshake pile-ups even when the rate limiter allows burst.
+
+### Why Limit Concurrency?
+
+TCP/TLS handshakes take time (~50-200ms). If the rate limiter allows 1000 connections in burst, launching 1000 concurrent handshakes would:
+- Overwhelm the network stack
+- Create connection timeouts
+- Waste rate limit budget on failed connections
+
+The in-flight semaphore limits concurrent handshakes to a reasonable number (default: 8).
 
 ### Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DSQL_DISTRIBUTED_CONN_LEASE_ENABLED` | `false` | Enable global connection count limiting |
-| `DSQL_DISTRIBUTED_CONN_LEASE_TABLE` | - | DynamoDB table name (required if enabled) |
-| `DSQL_DISTRIBUTED_CONN_LIMIT` | `10000` | Maximum connections cluster-wide |
+| `DSQL_RESERVOIR_INFLIGHT_LIMIT` | `8` | Max concurrent Open() calls |
 
-### DynamoDB Table Setup
+### Metrics
 
-Create the DynamoDB table before enabling distributed leasing:
-
-```bash
-# Create table with on-demand billing
-aws dynamodb create-table \
-    --table-name temporal-dsql-conn-lease \
-    --attribute-definitions AttributeName=pk,AttributeType=S \
-    --key-schema AttributeName=pk,KeyType=HASH \
-    --billing-mode PAY_PER_REQUEST \
-    --region us-east-1
-
-# Wait for table to be active
-aws dynamodb wait table-exists --table-name temporal-dsql-conn-lease --region us-east-1
-
-# Enable TTL for automatic lease cleanup
-aws dynamodb update-time-to-live \
-    --table-name temporal-dsql-conn-lease \
-    --time-to-live-specification Enabled=true,AttributeName=ttl_epoch \
-    --region us-east-1
-```
-
-### IAM Permissions
-
-Services need these DynamoDB permissions:
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "dynamodb:TransactWriteItems"
-            ],
-            "Resource": "arn:aws:dynamodb:us-east-1:123456789012:table/temporal-dsql-conn-lease"
-        }
-    ]
-}
-```
-
-**Note**: Only `TransactWriteItems` is needed - no read permissions required.
-
-### Failure Modes
-
-| Scenario | Behavior |
-|----------|----------|
-| DynamoDB unavailable | Lease acquire fails, refiller backs off and retries |
-| Limit reached | Lease acquire fails with `TransactionCanceledException`, refiller backs off |
-| Service crash | Lease items expire via TTL (3 min), counter self-corrects |
-| Network partition | Lease acquire may timeout, refiller retries |
-| Counter drift | Bounded by TTL (3 min), self-corrects over time |
-
-### Graceful Degradation
-
-If DynamoDB is unavailable, the system degrades gracefully:
-- Lease acquire fails, refiller backs off
-- Existing connections continue to work
-- New connections cannot be created until DynamoDB recovers
-- No data loss or corruption
-
-### Monitoring
-
-Watch these indicators for lease system health:
-
-```promql
-# Lease acquire failures (should be 0 in steady state)
-rate(dsql_reservoir_refill_failures_total{reason="lease_acquire"}[5m])
-
-# If this is consistently > 0, either:
-# - Global limit is reached (check counter in DynamoDB)
-# - DynamoDB is having issues (check AWS health)
-```
-
-### Capacity Planning
-
-When planning connection limits:
-
-| Deployment | Services | Instances | Pools/Instance | Conns/Pool | Total | Headroom |
-|------------|----------|-----------|----------------|------------|-------|----------|
-| Small | 4 | 2 | 2 | 25 | 400 | 96% |
-| Medium | 4 | 5 | 2 | 50 | 2,000 | 80% |
-| Large | 4 | 10 | 2 | 50 | 4,000 | 60% |
-| Very Large | 4 | 20 | 2 | 50 | 8,000 | 20% |
-
-**Recommendation**: Keep total connections below 80% of the 10,000 limit to allow for burst capacity and rolling deployments.
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dsql_refiller_inflight` | Gauge | Current number of in-flight Open() calls |
 
 ## Configuration
 
@@ -554,14 +467,29 @@ The reservoir is configured entirely through environment variables, allowing ope
 | `DSQL_RESERVOIR_BASE_LIFETIME` | `11m` | Duration | Base lifetime for connections before they are discarded. Should be less than DSQL's 60-minute connection limit. |
 | `DSQL_RESERVOIR_LIFETIME_JITTER` | `2m` | Duration | Random jitter added to each connection's lifetime to prevent synchronized expiry. Actual lifetime = base ± jitter/2. |
 | `DSQL_RESERVOIR_GUARD_WINDOW` | `45s` | Duration | Time before expiry when connections are considered too old to hand out. Prevents mid-transaction expiry. |
+| `DSQL_RESERVOIR_INFLIGHT_LIMIT` | `8` | Integer | Maximum concurrent Open() calls in the refiller. Prevents handshake pile-ups. |
 
-#### Distributed Connection Lease Configuration
+#### Distributed Rate Limiting Configuration
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED` | `false` | Boolean | Enable DynamoDB-backed distributed rate limiting. |
+| `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE` | - | String | DynamoDB table name for rate limiting. Required if enabled. |
+| `DSQL_TOKEN_BUCKET_ENABLED` | `false` | Boolean | Use token bucket algorithm (recommended). If false, uses per-second counter. |
+| `DSQL_TOKEN_BUCKET_RATE` | `100` | Integer | Token refill rate (tokens/second). Should match DSQL's sustained rate. |
+| `DSQL_TOKEN_BUCKET_CAPACITY` | `1000` | Integer | Maximum tokens in bucket. Should match DSQL's burst capacity. |
+| `DSQL_TOKEN_BUCKET_MAX_WAIT` | `30s` | Duration | Maximum time to wait for a token before failing. |
+
+#### Distributed Connection Limiting Configuration (Slot Blocks)
 
 | Variable | Default | Type | Description |
 |----------|---------|------|-------------|
 | `DSQL_DISTRIBUTED_CONN_LEASE_ENABLED` | `false` | Boolean | Enable DynamoDB-backed global connection count limiting. |
-| `DSQL_DISTRIBUTED_CONN_LEASE_TABLE` | - | String | DynamoDB table name for lease tracking. Required if distributed leasing is enabled. |
-| `DSQL_DISTRIBUTED_CONN_LIMIT` | `10000` | Integer | Maximum connections allowed cluster-wide. Should match DSQL's connection limit. |
+| `DSQL_DISTRIBUTED_CONN_LEASE_TABLE` | - | String | DynamoDB table name for slot blocks. Required if enabled. |
+| `DSQL_SLOT_BLOCK_SIZE` | `100` | Integer | Number of connection slots per block. |
+| `DSQL_SLOT_BLOCK_COUNT` | `100` | Integer | Total number of blocks (100 × 100 = 10k slots). |
+| `DSQL_SLOT_BLOCK_TTL` | `3m` | Duration | TTL for crash recovery. Blocks become available after TTL expires. |
+| `DSQL_SLOT_BLOCK_RENEW_INTERVAL` | `1m` | Duration | How often to renew TTL on owned blocks. |
 
 ### Configuration Details
 
@@ -738,16 +666,26 @@ export DSQL_RESERVOIR_GUARD_WINDOW=45s
 #### Production / Multi-Service (Shared Cluster)
 
 ```bash
-# Production configuration with distributed leasing
+# Production configuration with distributed rate limiting and slot blocks
 export DSQL_RESERVOIR_ENABLED=true
 export DSQL_RESERVOIR_TARGET_READY=50
 export DSQL_RESERVOIR_LOW_WATERMARK=50
 export DSQL_RESERVOIR_BASE_LIFETIME=11m
 export DSQL_RESERVOIR_LIFETIME_JITTER=2m
 export DSQL_RESERVOIR_GUARD_WINDOW=45s
+export DSQL_RESERVOIR_INFLIGHT_LIMIT=8
 
-# Enable distributed connection leasing
+# Enable token bucket rate limiting (recommended)
+export DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED=true
+export DSQL_DISTRIBUTED_RATE_LIMITER_TABLE=temporal-dsql-rate-limiter
+export DSQL_TOKEN_BUCKET_ENABLED=true
+export DSQL_TOKEN_BUCKET_RATE=100
+export DSQL_TOKEN_BUCKET_CAPACITY=1000
+
+# Enable slot block connection limiting
 export DSQL_DISTRIBUTED_CONN_LEASE_ENABLED=true
+export DSQL_DISTRIBUTED_CONN_LEASE_TABLE=temporal-dsql-conn-lease
+```
 export DSQL_DISTRIBUTED_CONN_LEASE_TABLE=temporal-dsql-conn-lease
 export DSQL_DISTRIBUTED_CONN_LIMIT=10000
 ```
@@ -814,22 +752,7 @@ database/sql          reservoirDriver          Reservoir
      │                      │                      │
 ```
 
-### Connection Checkout (Empty Reservoir with Wait)
-
-```
-database/sql          reservoirDriver          Reservoir           Refiller
-     │                      │                      │                   │
-     │──Open(dsn)──────────>│                      │                   │
-     │                      │──TryCheckout(now)───>│                   │
-     │                      │<──(nil, false)───────│                   │
-     │                      │                      │                   │
-     │                      │──WaitCheckout(100ms)>│                   │
-     │                      │                      │<──Return(pc)──────│
-     │                      │<──(PhysicalConn)─────│                   │
-     │<──reservoirConn──────│                      │                   │
-```
-
-### Connection Checkout (Empty Reservoir, Timeout)
+### Connection Checkout (Empty Reservoir)
 
 ```
 database/sql          reservoirDriver          Reservoir
@@ -837,14 +760,12 @@ database/sql          reservoirDriver          Reservoir
      │──Open(dsn)──────────>│                      │
      │                      │──TryCheckout(now)───>│
      │                      │<──(nil, false)───────│
+     │<──ErrReservoirEmpty──│                      │
      │                      │                      │
-     │                      │──WaitCheckout(100ms)>│
-     │                      │      (timeout)       │
-     │                      │<──(nil, false)───────│
-     │<──ErrBadConn─────────│                      │
-     │                      │                      │
-     │  (retry after backoff)                      │
+     │  (persistence layer retries)                │
 ```
+
+**Note:** `Open()` is strictly non-blocking. When the reservoir is empty, it immediately returns `ErrReservoirEmpty` (not `driver.ErrBadConn`). This is critical to prevent pool recreation cascades.
 
 ### Refiller Loop
 
@@ -866,12 +787,28 @@ Refiller              RateLimiter         LeaseManager         Reservoir
 
 | Scenario | Behavior |
 |----------|----------|
-| Reservoir empty | Brief wait, then return `ErrBadConn`, `database/sql` retries |
-| Connection expired on checkout | Discard, return `ErrBadConn` |
+| Reservoir empty | Return `ErrReservoirEmpty` immediately (non-blocking), persistence layer retries |
+| Connection expired on checkout | Discard, return `ErrReservoirEmpty` |
 | Connection error during use | Mark bad, discard on close |
 | Rate limiter timeout | Refiller backs off, retries |
 | Lease acquire fails (limit reached) | Refiller backs off, retries |
 | DynamoDB unavailable | Fall back to local-only (no global limiting) |
+
+### Why ErrReservoirEmpty (not driver.ErrBadConn)?
+
+When the reservoir is empty, we return `ErrReservoirEmpty` instead of `driver.ErrBadConn`. This is a critical design decision:
+
+- **`driver.ErrBadConn`** signals a corrupted connection and triggers `DatabaseHandle.ConvertError` to recreate the entire connection pool. This would create a new reservoir and leak the old refiller goroutines, causing a cascade of pool recreations.
+
+- **`ErrReservoirEmpty`** signals transient backpressure. The persistence layer treats this as a retryable error without triggering pool recreation.
+
+```go
+// ErrReservoirEmpty is returned when the reservoir has no connections available.
+// This is a transient backpressure signal, NOT a corrupted connection error.
+var ErrReservoirEmpty = errors.New("dsql reservoir empty: no connections available")
+```
+
+The persistence layer's retry logic handles `ErrReservoirEmpty` by backing off and retrying, giving the refiller time to replenish the reservoir.
 
 ## Metrics
 

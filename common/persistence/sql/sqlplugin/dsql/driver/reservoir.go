@@ -40,6 +40,9 @@ type ReservoirMetrics interface {
 	// RecordCheckoutLatency records the time taken to checkout a connection from reservoir
 	// This should be near-zero in steady state (just a channel receive)
 	RecordCheckoutLatency(d time.Duration)
+
+	// RecordRefillerInflight records the current number of in-flight Open() calls
+	RecordRefillerInflight(count int)
 }
 
 // noOpReservoirMetrics is a no-op implementation of ReservoirMetrics for when metrics are disabled
@@ -53,6 +56,7 @@ func (n *noOpReservoirMetrics) IncReservoirDiscards(reason string)       {}
 func (n *noOpReservoirMetrics) IncReservoirRefills()                     {}
 func (n *noOpReservoirMetrics) IncReservoirRefillFailures(reason string) {}
 func (n *noOpReservoirMetrics) RecordCheckoutLatency(d time.Duration)    {}
+func (n *noOpReservoirMetrics) RecordRefillerInflight(count int)         {}
 
 // PhysicalConn is a physical database connection held in the reservoir.
 // It wraps an underlying driver.Conn plus metadata used for expiration and global lease release.

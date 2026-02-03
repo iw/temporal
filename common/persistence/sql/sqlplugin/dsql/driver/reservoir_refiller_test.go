@@ -440,105 +440,9 @@ func TestReservoirRefiller_ConnectionOpenFailure(t *testing.T) {
 	require.Contains(t, metrics.refillFailReasons, "connection_open")
 }
 
-// TestReservoirRefiller_SteadyStateInterval tests steady state interval calculation
-func TestReservoirRefiller_SteadyStateInterval(t *testing.T) {
-	refiller := &reservoirRefiller{
-		cfg: ReservoirConfig{
-			TargetReady:  50,
-			BaseLifetime: 11 * time.Minute,
-		},
-	}
-
-	interval := refiller.steadyStateInterval()
-
-	// With 50 connections and 11 min lifetime:
-	// interval = 11 min / 50 = 13.2 seconds
-	expected := time.Duration(float64(11*time.Minute) / 50)
-	require.Equal(t, expected, interval)
-}
-
-// TestReservoirRefiller_SteadyStateInterval_ZeroTarget tests steady state with zero target
-func TestReservoirRefiller_SteadyStateInterval_ZeroTarget(t *testing.T) {
-	refiller := &reservoirRefiller{
-		cfg: ReservoirConfig{
-			TargetReady:  0,
-			BaseLifetime: 11 * time.Minute,
-		},
-	}
-
-	interval := refiller.steadyStateInterval()
-	require.Equal(t, IdleCheckInterval, interval)
-}
-
-// TestReservoirRefiller_CalculateRefillInterval tests interval calculation
-func TestReservoirRefiller_CalculateRefillInterval(t *testing.T) {
-	refiller := &reservoirRefiller{
-		cfg: ReservoirConfig{
-			TargetReady:  100,
-			LowWatermark: 50,
-		},
-	}
-
-	warmupInterval := 10 * time.Millisecond
-	steadyInterval := 1 * time.Second
-
-	tests := []struct {
-		name     string
-		ready    int
-		expected time.Duration
-	}{
-		{
-			name:     "below low watermark",
-			ready:    25,
-			expected: warmupInterval,
-		},
-		{
-			name:     "at low watermark",
-			ready:    50,
-			expected: warmupInterval, // progress = 0
-		},
-		{
-			name:     "at target",
-			ready:    100,
-			expected: steadyInterval,
-		},
-		{
-			name:     "above target",
-			ready:    150,
-			expected: steadyInterval,
-		},
-		{
-			name:  "midway between low watermark and target",
-			ready: 75, // progress = 0.5
-			// expected = warmup + 0.5 * (steady - warmup)
-			expected: time.Duration(float64(warmupInterval) + 0.5*float64(steadyInterval-warmupInterval)),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			interval := refiller.calculateRefillInterval(tt.ready, warmupInterval, steadyInterval)
-			require.Equal(t, tt.expected, interval)
-		})
-	}
-}
-
-// TestReservoirRefiller_CalculateRefillInterval_EqualWatermarks tests when low watermark equals target
-func TestReservoirRefiller_CalculateRefillInterval_EqualWatermarks(t *testing.T) {
-	refiller := &reservoirRefiller{
-		cfg: ReservoirConfig{
-			TargetReady:  50,
-			LowWatermark: 50, // Same as target
-		},
-	}
-
-	warmupInterval := 10 * time.Millisecond
-	steadyInterval := 1 * time.Second
-
-	// When at or above low watermark (which equals target), should use steady interval
-	interval := refiller.calculateRefillInterval(50, warmupInterval, steadyInterval)
-	require.Equal(t, steadyInterval, interval)
-}
+// NOTE: Tests for steadyStateInterval() and calculateRefillInterval() were removed
+// because those methods were removed in favor of a simpler rate-limiter-only pacing model.
+// The refiller now runs back-to-back openOne() calls with the rate limiter as the only throttle.
 
 // TestReservoirRefiller_LeaseReleasedOnRateLimitFailure tests lease release on rate limit failure
 func TestReservoirRefiller_LeaseReleasedOnRateLimitFailure(t *testing.T) {
@@ -1003,45 +907,9 @@ func TestReservoirRefiller_LeaseReleasedOnConnectionFailure(t *testing.T) {
 	require.Greater(t, leaseManager.releaseCalls.Load(), int64(0))
 }
 
-// TestReservoirRefiller_ZeroBaseLifetime tests refiller with zero base lifetime
-func TestReservoirRefiller_ZeroBaseLifetime(t *testing.T) {
-	refiller := &reservoirRefiller{
-		cfg: ReservoirConfig{
-			TargetReady:  50,
-			BaseLifetime: 0,
-		},
-	}
-
-	interval := refiller.steadyStateInterval()
-	require.Equal(t, IdleCheckInterval, interval)
-}
-
-// TestReservoirRefiller_NegativeBaseLifetime tests refiller with negative base lifetime
-func TestReservoirRefiller_NegativeBaseLifetime(t *testing.T) {
-	refiller := &reservoirRefiller{
-		cfg: ReservoirConfig{
-			TargetReady:  50,
-			BaseLifetime: -5 * time.Minute,
-		},
-	}
-
-	interval := refiller.steadyStateInterval()
-	require.Equal(t, IdleCheckInterval, interval)
-}
-
-// TestReservoirRefiller_VerySmallSteadyStateInterval tests that steady state interval has minimum
-func TestReservoirRefiller_VerySmallSteadyStateInterval(t *testing.T) {
-	refiller := &reservoirRefiller{
-		cfg: ReservoirConfig{
-			TargetReady:  10000, // Very high target
-			BaseLifetime: 1 * time.Second,
-		},
-	}
-
-	interval := refiller.steadyStateInterval()
-	// Should be at least WarmupInterval
-	require.GreaterOrEqual(t, interval, WarmupInterval)
-}
+// NOTE: Tests for steadyStateInterval() edge cases (zero/negative base lifetime,
+// very small intervals) were removed because steadyStateInterval() was removed
+// in favor of a simpler rate-limiter-only pacing model.
 
 // TestReservoirRefiller_LogFuncCalled tests that log function is called
 func TestReservoirRefiller_LogFuncCalled(t *testing.T) {

@@ -151,6 +151,41 @@ rate(dsql_reservoir_refills_total[5m]) /
     summary: "DSQL reservoir discarding connections"
 ```
 
+## Slot Block Metrics
+
+When slot block connection limiting is enabled (`DSQL_DISTRIBUTED_CONN_LEASE_ENABLED=true`), these metrics are available:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dsql_slot_blocks_owned` | Gauge | Number of slot blocks owned by this service |
+| `dsql_slot_blocks_slots_used` | Gauge | Number of slots currently in use |
+
+### Slot Block Health Indicators
+
+```promql
+# Slot utilization (should be < 1.0)
+dsql_slot_blocks_slots_used / (dsql_slot_blocks_owned * 100)
+
+# Available slots
+(dsql_slot_blocks_owned * 100) - dsql_slot_blocks_slots_used
+```
+
+## Refiller Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dsql_refiller_inflight` | Gauge | Current number of in-flight Open() calls |
+
+### Refiller Health Indicators
+
+```promql
+# In-flight connections (should be <= DSQL_RESERVOIR_INFLIGHT_LIMIT)
+dsql_refiller_inflight
+
+# High in-flight may indicate slow handshakes or rate limiter contention
+dsql_refiller_inflight > 6
+```
+
 ## Derived Metrics
 
 ### Pool Saturation

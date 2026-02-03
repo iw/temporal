@@ -71,6 +71,39 @@ func (p *plugin) GetVisibilityQueryConverter() sqlplugin.VisibilityQueryConverte
 	return p.queryConverter
 }
 
+// reservoirHandleHolder holds a reference to the current reservoir handle.
+// This allows the connect closure to stop the old reservoir before creating a new one,
+// preventing goroutine leaks when DatabaseHandle.reconnect() is triggered.
+type reservoirHandleHolder struct {
+	mu     sync.Mutex
+	handle *driver.ReservoirHandle
+}
+
+func (h *reservoirHandleHolder) Set(handle *driver.ReservoirHandle) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Stop the old reservoir before replacing it
+	if h.handle != nil {
+		h.handle.Stop()
+	}
+	h.handle = handle
+}
+
+func (h *reservoirHandleHolder) Get() *driver.ReservoirHandle {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.handle
+}
+
+func (h *reservoirHandleHolder) Stop() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.handle != nil {
+		h.handle.Stop()
+		h.handle = nil
+	}
+}
+
 // CreateDB initialize the db object
 func (p *plugin) CreateDB(
 	dbKind sqlplugin.DbKind,
@@ -79,16 +112,60 @@ func (p *plugin) CreateDB(
 	logger log.Logger,
 	metricsHandler metrics.Handler,
 ) (sqlplugin.GenericDB, error) {
+	// Create a holder for the reservoir handle that persists across reconnects.
+	// This allows us to stop the old reservoir when a reconnect happens.
+	resHolder := &reservoirHandleHolder{}
+
 	connect := func() (*sqlx.DB, error) {
 		if cfg.Connect != nil {
 			return cfg.Connect(cfg)
 		}
-		return p.createDSQLConnection(cfg, r, logger, metricsHandler)
+		db, _, reservoirHandle, err := p.createConnectionWithTokenRefreshFull(cfg, r, logger, metricsHandler)
+		if err != nil {
+			return nil, err
+		}
+		// Store the new reservoir handle (this also stops the old one if any)
+		resHolder.Set(reservoirHandle)
+		return db, nil
 	}
 
 	handle := sqlplugin.NewDatabaseHandle(dbKind, connect, p.driver.IsConnNeedsRefreshError, logger, metricsHandler, clock.NewRealTimeSource())
 	db := newDBWithDependencies(dbKind, cfg.DatabaseName, p.driver, handle, nil, logger, metricsHandler, p.retryConfig)
+
+	// Store the holder in the db so Close() can stop the reservoir
+	db.reservoirHolder = resHolder
+
 	return db, nil
+}
+
+// createConnectionWithTokenRefreshFull is the full connection creation function that returns
+// the reservoir handle for lifecycle management. This is called from the connect closure
+// in CreateDB to ensure the reservoir can be stopped on reconnect.
+func (p *plugin) createConnectionWithTokenRefreshFull(
+	cfg *config.SQL,
+	resolver resolver.ServiceResolver,
+	logger log.Logger,
+	metricsHandler metrics.Handler,
+) (*sqlx.DB, *driver.ConnectionRegistry, *driver.ReservoirHandle, error) {
+	if cfg.DatabaseName != "" {
+		return p.createDSQLConnectionWithAuthFull(cfg, resolver, logger, metricsHandler)
+	}
+
+	// database name not provided, try defaults
+	defer func() { cfg.DatabaseName = "" }()
+
+	var errors []error
+	for _, databaseName := range defaultDatabaseNames {
+		cfg.DatabaseName = databaseName
+		if db, registry, resHandle, err := p.createDSQLConnectionWithAuthFull(cfg, resolver, logger, metricsHandler); err == nil {
+			return db, registry, resHandle, nil
+		} else {
+			errors = append(errors, err)
+		}
+	}
+	return nil, nil, nil, serviceerror.NewUnavailable(
+		fmt.Sprintf("unable to connect to DSQL, tried default DB names: %v, errors: %v", strings.Join(defaultDatabaseNames, ","), errors),
+	)
 }
 
 // createDSQLConnection creates a DSQL database connection with IAM authentication
@@ -98,37 +175,18 @@ func (p *plugin) createDSQLConnection(
 	logger log.Logger,
 	metricsHandler metrics.Handler,
 ) (*sqlx.DB, error) {
-	if cfg.DatabaseName != "" {
-		return p.createDSQLConnectionWithAuth(cfg, resolver, logger, metricsHandler)
-	}
-
-	// database name not provided, try defaults
-	defer func() { cfg.DatabaseName = "" }()
-
-	var errors []error
-	for _, databaseName := range defaultDatabaseNames {
-		cfg.DatabaseName = databaseName
-		if db, err := p.createDSQLConnectionWithAuth(cfg, resolver, logger, metricsHandler); err == nil {
-			return db, nil
-		} else {
-			errors = append(errors, err)
-		}
-	}
-	return nil, serviceerror.NewUnavailable(
-		fmt.Sprintf("unable to connect to DSQL, tried default DB names: %v, errors: %v", strings.Join(defaultDatabaseNames, ","), errors),
-	)
+	db, _, _, err := p.createConnectionWithTokenRefreshFull(cfg, resolver, logger, metricsHandler)
+	return db, err
 }
 
-// createDSQLConnectionWithAuth creates a DSQL connection with IAM authentication.
-// It uses a token-refreshing driver that injects fresh IAM tokens before each
-// new connection, ensuring that connections created by the pool (due to MaxConnLifetime,
-// pool growth, or connection failure) always have valid tokens.
-func (p *plugin) createDSQLConnectionWithAuth(
+// createDSQLConnectionWithAuthFull creates a DSQL connection with IAM authentication
+// and returns the reservoir handle for lifecycle management.
+func (p *plugin) createDSQLConnectionWithAuthFull(
 	cfg *config.SQL,
 	resolver resolver.ServiceResolver,
 	logger log.Logger,
 	metricsHandler metrics.Handler,
-) (*sqlx.DB, error) {
+) (*sqlx.DB, *driver.ConnectionRegistry, *driver.ReservoirHandle, error) {
 	// Apply staggered startup delay (only on first connection)
 	p.startupDelayOnce.Do(func() {
 		if delay := StaggeredStartupDelay(); delay > 0 {
@@ -144,7 +202,7 @@ func (p *plugin) createDSQLConnectionWithAuth(
 		// Fallback to AWS_REGION if REGION is not set
 		region = os.Getenv("AWS_REGION")
 		if region == "" {
-			return nil, fmt.Errorf("REGION or AWS_REGION environment variable must be set for DSQL IAM authentication")
+			return nil, nil, nil, fmt.Errorf("REGION or AWS_REGION environment variable must be set for DSQL IAM authentication")
 		}
 	}
 
@@ -161,7 +219,10 @@ func (p *plugin) createDSQLConnectionWithAuth(
 	// Initialize rate limiter (once per plugin)
 	// The rate limiter is passed to the token-refreshing driver so it can
 	// rate-limit ALL connection attempts, including pool growth.
-	// Can be either local (per-instance) or distributed (DynamoDB-backed).
+	// Can be either:
+	// - Token bucket (recommended): Uses DSQL's burst capacity (1000) with 100/sec sustained
+	// - Per-second counter: Legacy distributed rate limiter
+	// - Local: Per-instance rate limiter (no coordination)
 	p.rateLimiterOnce.Do(func() {
 		if IsDistributedRateLimiterEnabled() {
 			// Use distributed rate limiter backed by DynamoDB
@@ -181,11 +242,22 @@ func (p *plugin) createDSQLConnectionWithAuth(
 				return
 			}
 
-			p.rateLimiter = NewDistributedRateLimiter(ddbClient, tableName, clusterEndpoint)
-			logger.Info("DSQL distributed rate limiter initialized",
-				tag.NewStringTag("table", tableName),
-				tag.NewStringTag("endpoint", clusterEndpoint),
-				tag.NewInt64("limit_per_second", int64(getEnvInt(DistributedRateLimiterLimitEnvVar, DefaultDistributedRateLimiterLimit))))
+			// Check if token bucket mode is enabled (recommended)
+			if IsTokenBucketEnabled() {
+				p.rateLimiter = NewTokenBucketLimiter(ddbClient, tableName, clusterEndpoint, logger)
+				logger.Info("DSQL token bucket rate limiter initialized",
+					tag.NewStringTag("table", tableName),
+					tag.NewStringTag("endpoint", clusterEndpoint),
+					tag.NewInt64("rate_per_sec", int64(getEnvInt(TokenBucketRateEnvVar, DefaultTokenBucketRate))),
+					tag.NewInt64("capacity", int64(getEnvInt(TokenBucketCapacityEnvVar, DefaultTokenBucketCapacity))))
+			} else {
+				// Legacy per-second counter mode
+				p.rateLimiter = NewDistributedRateLimiter(ddbClient, tableName, clusterEndpoint)
+				logger.Info("DSQL distributed rate limiter initialized (per-second counter)",
+					tag.NewStringTag("table", tableName),
+					tag.NewStringTag("endpoint", clusterEndpoint),
+					tag.NewInt64("limit_per_second", int64(getEnvInt(DistributedRateLimiterLimitEnvVar, DefaultDistributedRateLimiterLimit))))
+			}
 		} else {
 			// Use local rate limiter (per-instance)
 			p.rateLimiter = NewConnectionRateLimiter()
@@ -198,7 +270,7 @@ func (p *plugin) createDSQLConnectionWithAuth(
 	// Get or initialize token cache
 	tokenCache, err := p.getOrInitTokenCache(context.Background(), region, logger, metricsHandler)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize token cache: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to initialize token cache: %w", err)
 	}
 
 	tokenDuration := GetConfiguredTokenDuration()
@@ -224,27 +296,28 @@ func (p *plugin) createDSQLConnectionWithAuth(
 	}
 
 	// Create the connection using the token-refreshing driver
-	db, _, err := p.createConnectionWithTokenRefresh(cfg, resolver, tokenProvider, logger, metricsHandler)
+	// Return the reservoir handle so the caller can stop it on reconnect
+	db, registry, resHandle, err := p.createConnectionWithTokenRefresh(cfg, resolver, tokenProvider, logger, metricsHandler)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	logger.Info("DSQL connection established successfully with token-refreshing driver",
 		tag.NewStringTag("endpoint", clusterEndpoint))
 
-	return db, nil
+	return db, registry, resHandle, nil
 }
 
 // createConnectionWithTokenRefresh creates a database connection using a custom driver
 // that refreshes IAM tokens before each new connection.
-// Returns the database connection and the connection registry for lifecycle tracking.
+// Returns the database connection, the connection registry for lifecycle tracking, and the reservoir handle (if reservoir mode).
 func (p *plugin) createConnectionWithTokenRefresh(
 	cfg *config.SQL,
 	resolver resolver.ServiceResolver,
 	tokenProvider driver.TokenProvider,
 	logger log.Logger,
 	metricsHandler metrics.Handler,
-) (*sqlx.DB, *driver.ConnectionRegistry, error) {
+) (*sqlx.DB, *driver.ConnectionRegistry, *driver.ReservoirHandle, error) {
 	// Build the base DSN (with a placeholder password that will be replaced)
 	dsqlConfig := *cfg
 	dsqlConfig.User = adminUser
@@ -253,7 +326,7 @@ func (p *plugin) createConnectionWithTokenRefresh(
 	// Use session to build the DSN
 	baseDSN, err := session.BuildDSN(&dsqlConfig, resolver)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to build DSN: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to build DSN: %w", err)
 	}
 
 	// Register a token-refreshing driver for this connection with logging
@@ -290,24 +363,66 @@ func (p *plugin) createConnectionWithTokenRefresh(
 		if maxOpen <= 0 {
 			maxOpen = session.DefaultMaxConns
 		}
-		resCfg := GetReservoirConfig(maxOpen)
+		resCfg := GetReservoirConfig(maxOpen, cfg.PoolSizeHint)
 
-		// Optional distributed conn-count lease limiter.
+		// Optional distributed conn-count slot block manager.
+		// Uses block-based allocation to avoid hot partition issues.
+		// Skip for ephemeral pools - they're short-lived and don't need global coordination.
 		var leaseMgr driver.LeaseManager
-		if IsDistributedConnLeaseEnabled() {
+		if IsDistributedConnLeaseEnabled() && cfg.PoolSizeHint != "ephemeral" {
 			table := GetDistributedConnLeaseTable()
 			if table == "" {
 				logger.Error("Distributed conn lease enabled but DSQL_DISTRIBUTED_CONN_LEASE_TABLE not set; proceeding without global conn count limiting")
 			} else {
 				ddbClient, err := p.createDynamoDBClient(context.Background(), os.Getenv("AWS_REGION"), logger)
 				if err != nil {
-					logger.Error("Failed to create DynamoDB client for distributed conn leases; proceeding without global conn count limiting", tag.Error(err))
+					logger.Error("Failed to create DynamoDB client for slot block manager; proceeding without global conn count limiting", tag.Error(err))
 				} else {
-					leases, err := NewDistributedConnLeases(ddbClient, table, os.Getenv("CLUSTER_ENDPOINT"), "unknown", GetDistributedConnLimit(), DefaultDistributedConnLeaseTTL, logger)
+					// Get service name from environment or use a default
+					serviceName := os.Getenv("SERVICES")
+					if serviceName == "" {
+						serviceName = "unknown"
+					}
+
+					// Configure slot blocks based on target pool size and global limit
+					slotCfg := GetSlotBlockConfig(resCfg.TargetReady)
+
+					// Create slot block metrics
+					slotBlockMetrics := NewSlotBlockMetrics(metricsHandler)
+
+					slotMgr, err := NewSlotBlockManager(
+						ddbClient,
+						table,
+						os.Getenv("CLUSTER_ENDPOINT"),
+						serviceName,
+						slotCfg,
+						logger,
+						slotBlockMetrics,
+					)
 					if err != nil {
-						logger.Error("Failed to initialize distributed conn leases; proceeding without global conn count limiting", tag.Error(err))
+						logger.Error("Failed to initialize slot block manager; proceeding without global conn count limiting", tag.Error(err))
 					} else {
-						leaseMgr = leases
+						// Acquire enough slots for our target pool size
+						acquireCtx, acquireCancel := context.WithTimeout(context.Background(), 30*time.Second)
+						acquiredSlots, err := slotMgr.AcquireSlots(acquireCtx, resCfg.TargetReady)
+						acquireCancel()
+
+						if err != nil {
+							logger.Error("Failed to acquire slot blocks; proceeding without global conn count limiting",
+								tag.Error(err),
+								tag.NewInt("acquired_slots", acquiredSlots),
+								tag.NewInt("target_slots", resCfg.TargetReady))
+						} else if acquiredSlots < resCfg.TargetReady {
+							logger.Warn("Acquired fewer slots than target; may not reach full pool size",
+								tag.NewInt("acquired_slots", acquiredSlots),
+								tag.NewInt("target_slots", resCfg.TargetReady))
+							leaseMgr = slotMgr
+						} else {
+							logger.Info("Slot block manager initialized",
+								tag.NewInt("acquired_slots", acquiredSlots),
+								tag.NewInt("target_slots", resCfg.TargetReady))
+							leaseMgr = slotMgr
+						}
 					}
 				}
 			}
@@ -316,33 +431,38 @@ func (p *plugin) createConnectionWithTokenRefresh(
 		// Create reservoir metrics using the metrics handler
 		reservoirMetrics := NewReservoirMetrics(metricsHandler)
 
-		driverName, res, err := driver.RegisterReservoirDriverWithLogger(
+		driverName, reservoirHandle, err := driver.RegisterReservoirDriverWithHandle(
 			adminUser,
 			baseDSN,
 			tokenProvider,
 			p.rateLimiter,
 			leaseMgr,
 			driver.ReservoirConfig{
-				TargetReady:  resCfg.TargetReady,
-				LowWatermark: resCfg.LowWatermark,
-				BaseLifetime: resCfg.BaseLifetime,
-				Jitter:       resCfg.Jitter,
-				GuardWindow:  resCfg.GuardWindow,
+				TargetReady:   resCfg.TargetReady,
+				LowWatermark:  resCfg.LowWatermark,
+				BaseLifetime:  resCfg.BaseLifetime,
+				Jitter:        resCfg.Jitter,
+				GuardWindow:   resCfg.GuardWindow,
+				InflightLimit: resCfg.InflightLimit,
 			},
 			logFunc,
 			reservoirMetrics,
 		)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to register reservoir driver: %w", err)
+			return nil, nil, nil, fmt.Errorf("failed to register reservoir driver: %w", err)
 		}
 
-		logger.Info("Registered reservoir-backed driver for DSQL", tag.NewStringTag("driver_name", driverName))
+		logger.Info("Registered reservoir-backed driver for DSQL",
+			tag.NewStringTag("driver_name", driverName),
+			tag.NewStringTag("pool_size_hint", cfg.PoolSizeHint),
+			tag.NewInt("target_ready", resCfg.TargetReady))
 
 		// Wait for reservoir to reach low watermark before accepting requests.
 		// This ensures the service has connections available when it starts handling traffic.
 		logger.Info("Waiting for reservoir initial fill",
 			tag.NewInt("target", resCfg.LowWatermark),
-			tag.NewDurationTag("timeout", resCfg.InitialFillTimeout))
+			tag.NewDurationTag("timeout", resCfg.InitialFillTimeout),
+			tag.NewStringTag("pool_size_hint", cfg.PoolSizeHint))
 
 		fillCtx, fillCancel := context.WithTimeout(context.Background(), resCfg.InitialFillTimeout)
 		defer fillCancel()
@@ -350,7 +470,7 @@ func (p *plugin) createConnectionWithTokenRefresh(
 		fillStart := time.Now()
 		timedOut := false
 	fillLoop:
-		for res.Len() < resCfg.LowWatermark {
+		for reservoirHandle.Len() < resCfg.LowWatermark {
 			select {
 			case <-fillCtx.Done():
 				timedOut = true
@@ -361,23 +481,26 @@ func (p *plugin) createConnectionWithTokenRefresh(
 		}
 
 		fillDuration := time.Since(fillStart)
-		currentSize := res.Len()
+		currentSize := reservoirHandle.Len()
 
 		if timedOut {
 			logger.Warn("Reservoir initial fill timeout - proceeding with partial fill",
 				tag.NewInt("current", currentSize),
 				tag.NewInt("target", resCfg.LowWatermark),
-				tag.NewDurationTag("elapsed", fillDuration))
+				tag.NewDurationTag("elapsed", fillDuration),
+				tag.NewStringTag("pool_size_hint", cfg.PoolSizeHint))
 		} else {
 			logger.Info("Reservoir initial fill complete",
 				tag.NewInt("current", currentSize),
 				tag.NewInt("target", resCfg.LowWatermark),
-				tag.NewDurationTag("elapsed", fillDuration))
+				tag.NewDurationTag("elapsed", fillDuration),
+				tag.NewStringTag("pool_size_hint", cfg.PoolSizeHint))
 		}
 
 		sqlDB, err := sql.Open(driverName, baseDSN)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to open DSQL connection (reservoir): %w", err)
+			reservoirHandle.Stop() // Clean up refiller on error
+			return nil, nil, nil, fmt.Errorf("failed to open DSQL connection (reservoir): %w", err)
 		}
 		db := sqlx.NewDb(sqlDB, "pgx")
 
@@ -400,7 +523,8 @@ func (p *plugin) createConnectionWithTokenRefresh(
 
 		if err := db.Ping(); err != nil {
 			db.Close()
-			return nil, nil, fmt.Errorf("failed to ping DSQL (reservoir): %w", err)
+			reservoirHandle.Stop() // Clean up refiller on error
+			return nil, nil, nil, fmt.Errorf("failed to ping DSQL (reservoir): %w", err)
 		}
 
 		logger.Info("DSQL reservoir mode enabled",
@@ -410,16 +534,17 @@ func (p *plugin) createConnectionWithTokenRefresh(
 			tag.NewDurationTag("reservoir_lifetime_jitter", resCfg.Jitter),
 			tag.NewDurationTag("reservoir_guard_window", resCfg.GuardWindow),
 			tag.NewDurationTag("reservoir_initial_fill_timeout", resCfg.InitialFillTimeout),
+			tag.NewStringTag("pool_size_hint", cfg.PoolSizeHint),
 		)
 
-		// Return nil for registry - reservoir mode doesn't use connection registry
-		return db, nil, nil
+		// Return reservoir handle for lifecycle management
+		return db, nil, reservoirHandle, nil
 	}
 
 	// Non-reservoir mode: use token-refreshing driver with pool warmup and keeper
 	driverName, registry, err := driver.RegisterTokenRefreshingDriverWithLogger(adminUser, tokenProvider, p.rateLimiter, logFunc)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to register token-refreshing driver: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to register token-refreshing driver: %w", err)
 	}
 
 	logger.Info("Registered token-refreshing driver for DSQL",
@@ -429,7 +554,7 @@ func (p *plugin) createConnectionWithTokenRefresh(
 	// The driver will call tokenProvider to get a fresh token before each connection
 	sqlDB, err := sql.Open(driverName, baseDSN)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open DSQL connection: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to open DSQL connection: %w", err)
 	}
 
 	// Wrap with sqlx using "pgx" as the driver name for correct bindvar type ($1, $2, etc.)
@@ -469,7 +594,7 @@ func (p *plugin) createConnectionWithTokenRefresh(
 	// Verify connection works
 	if err := db.Ping(); err != nil {
 		db.Close()
-		return nil, nil, fmt.Errorf("failed to ping DSQL: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to ping DSQL: %w", err)
 	}
 
 	// Log pool configuration for debugging
@@ -523,7 +648,8 @@ func (p *plugin) createConnectionWithTokenRefresh(
 	// Start the background keeper goroutine
 	keeper.Start(context.Background())
 
-	return db, registry, nil
+	// Return nil for reservoir handle - non-reservoir mode doesn't use it
+	return db, registry, nil, nil
 }
 
 // getOrInitTokenCache returns the token cache, initializing it if necessary.

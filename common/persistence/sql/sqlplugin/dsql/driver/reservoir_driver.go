@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net/url"
 	"sync"
@@ -13,13 +14,21 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
+// ErrReservoirEmpty is returned when the reservoir has no connections available.
+// This is a transient backpressure signal, NOT a corrupted connection error.
+// IMPORTANT: This error intentionally does NOT wrap driver.ErrBadConn to prevent
+// DatabaseHandle.ConvertError from triggering a full pool recreation.
+// The persistence layer should treat this as a retryable transient error.
+var ErrReservoirEmpty = errors.New("dsql reservoir empty: no connections available")
+
 // ReservoirConfig defines reservoir behavior parameters.
 type ReservoirConfig struct {
-	TargetReady  int
-	LowWatermark int
-	BaseLifetime time.Duration
-	Jitter       time.Duration
-	GuardWindow  time.Duration
+	TargetReady   int
+	LowWatermark  int
+	BaseLifetime  time.Duration
+	Jitter        time.Duration
+	GuardWindow   time.Duration
+	InflightLimit int // Max concurrent Open() calls in refiller (default: 8)
 }
 
 // LeaseManager provides global connection-count lease acquisition/release.
@@ -29,28 +38,52 @@ type LeaseManager interface {
 }
 
 // reservoirDriver implements driver.Driver and sources connections from an in-process reservoir.
-// Open() is non-blocking for the fast path, but may briefly wait when reservoir is empty.
+// Open() is strictly non-blocking - it either returns a connection immediately or ErrReservoirEmpty.
 type reservoirDriver struct {
-	res              *Reservoir
-	openCount        atomic.Int64
-	logFunc          LogFunc
-	metrics          ReservoirMetrics
-	emptyWaitTimeout time.Duration
+	res       *Reservoir
+	refiller  *reservoirRefiller
+	openCount atomic.Int64
+	logFunc   LogFunc
+	metrics   ReservoirMetrics
 }
 
 const reservoirDriverNamePrefix = "pgx-dsql-reservoir-"
-const defaultEmptyWaitTimeout = 100 * time.Millisecond
 
 var (
 	reservoirDriverMu      sync.Mutex
 	reservoirDriverCounter int
 )
 
+// ReservoirHandle provides access to the reservoir and its refiller for lifecycle management.
+// The caller should call Stop() when the database connection is closed to prevent goroutine leaks.
+type ReservoirHandle struct {
+	Reservoir *Reservoir
+	refiller  *reservoirRefiller
+}
+
+// Stop stops the refiller goroutines. This should be called when the database connection is closed.
+func (h *ReservoirHandle) Stop() {
+	if h.refiller != nil {
+		h.refiller.Stop()
+	}
+}
+
+// Len returns the current number of connections in the reservoir.
+func (h *ReservoirHandle) Len() int {
+	if h.Reservoir != nil {
+		return h.Reservoir.Len()
+	}
+	return 0
+}
+
 // RegisterReservoirDriverWithLogger registers a new reservoir-backed driver, starts the refiller loop,
 // and returns the unique driver name to pass to sql.Open().
 //
 // IMPORTANT: Open() never blocks on any global limiter. All potentially blocking work is performed by
 // the background refiller.
+//
+// The returned ReservoirHandle should be used to stop the refiller when the database connection is closed.
+// Failure to call Stop() will result in goroutine leaks.
 func RegisterReservoirDriverWithLogger(
 	username string,
 	baseDSN string,
@@ -61,6 +94,25 @@ func RegisterReservoirDriverWithLogger(
 	logFunc LogFunc,
 	metrics ReservoirMetrics,
 ) (string, *Reservoir, error) {
+	driverName, handle, err := RegisterReservoirDriverWithHandle(username, baseDSN, tokenProvider, rateLimiter, leaseManager, cfg, logFunc, metrics)
+	if err != nil {
+		return "", nil, err
+	}
+	return driverName, handle.Reservoir, nil
+}
+
+// RegisterReservoirDriverWithHandle is like RegisterReservoirDriverWithLogger but returns a ReservoirHandle
+// that allows the caller to stop the refiller goroutines when the database connection is closed.
+func RegisterReservoirDriverWithHandle(
+	username string,
+	baseDSN string,
+	tokenProvider TokenProvider,
+	rateLimiter RateLimiter,
+	leaseManager LeaseManager,
+	cfg ReservoirConfig,
+	logFunc LogFunc,
+	metrics ReservoirMetrics,
+) (string, *ReservoirHandle, error) {
 	if tokenProvider == nil {
 		return "", nil, fmt.Errorf("tokenProvider cannot be nil")
 	}
@@ -114,20 +166,33 @@ func RegisterReservoirDriverWithLogger(
 	}
 	refiller.Start()
 
-	wrapper := &reservoirDriver{res: res, logFunc: logFunc, metrics: metrics, emptyWaitTimeout: defaultEmptyWaitTimeout}
+	wrapper := &reservoirDriver{res: res, refiller: refiller, logFunc: logFunc, metrics: metrics}
 	sql.Register(driverName, wrapper)
-	return driverName, res, nil
+
+	handle := &ReservoirHandle{
+		Reservoir: res,
+		refiller:  refiller,
+	}
+
+	return driverName, handle, nil
 }
 
 // Open implements driver.Driver.
-// It first tries a non-blocking checkout. If the reservoir is empty, it waits briefly
-// (up to emptyWaitTimeout) for the refiller to catch up before returning ErrBadConn.
+// Open() is STRICTLY NON-BLOCKING - it either returns a connection immediately or ErrReservoirEmpty.
+//
+// IMPORTANT: We return ErrReservoirEmpty (not driver.ErrBadConn) when the reservoir is empty.
+// This is a critical design decision:
+//   - driver.ErrBadConn signals a corrupted connection and triggers DatabaseHandle.ConvertError
+//     to recreate the entire connection pool, which would create a new reservoir and leak the
+//     old refiller goroutines.
+//   - ErrReservoirEmpty signals transient backpressure and should be handled as a retryable
+//     error at the persistence layer without triggering pool recreation.
 func (d *reservoirDriver) Open(_ string) (driver.Conn, error) {
 	start := time.Now()
 	openNum := d.openCount.Add(1)
 	now := start.UTC()
 
-	// Try non-blocking first
+	// Strictly non-blocking checkout - never wait
 	pc, ok := d.res.TryCheckout(now)
 	if ok {
 		d.metrics.RecordCheckoutLatency(time.Since(start))
@@ -137,22 +202,14 @@ func (d *reservoirDriver) Open(_ string) (driver.Conn, error) {
 		return newReservoirConn(d.res, pc), nil
 	}
 
-	// Brief wait for refiller to catch up
-	pc, ok = d.res.WaitCheckout(d.emptyWaitTimeout)
-	if ok {
-		d.metrics.RecordCheckoutLatency(time.Since(start))
-		if d.logFunc != nil {
-			d.logFunc("Reservoir driver Open() - connection checked out after wait", "open_count", openNum, "reservoir_ready", d.res.Len())
-		}
-		return newReservoirConn(d.res, pc), nil
-	}
-
-	// Record latency even on failure (will be the full wait timeout)
+	// Reservoir empty - return sentinel error (NOT driver.ErrBadConn)
+	// This prevents DatabaseHandle.ConvertError from triggering pool recreation cascade
 	d.metrics.RecordCheckoutLatency(time.Since(start))
+	d.metrics.IncReservoirEmpty()
 	if d.logFunc != nil {
-		d.logFunc("Reservoir driver Open() - no ready connections after wait", "open_count", openNum, "wait_timeout_ms", d.emptyWaitTimeout.Milliseconds())
+		d.logFunc("Reservoir driver Open() - reservoir empty", "open_count", openNum, "reservoir_ready", 0)
 	}
-	return nil, driver.ErrBadConn
+	return nil, ErrReservoirEmpty
 }
 
 // injectToken creates a new DSN with the provided token as the password.

@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jmoiron/sqlx"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
@@ -38,14 +39,16 @@ type db struct {
 	dbName   string
 	dbDriver driver.Driver
 
-	plugin       *plugin
-	cfg          *config.SQL
-	resolver     resolver.ServiceResolver
-	converter    DataConverter
-	retryManager *RetryManager
-	idGenerator  sqlplugin.IDGenerator // ID generator for tables without BIGSERIAL support
-	poolMetrics  DSQLMetrics           // Pool metrics collector (only for main DB, not transactions)
-	logger       log.Logger            // Logger for assertions and error reporting
+	plugin          *plugin
+	cfg             *config.SQL
+	resolver        resolver.ServiceResolver
+	converter       DataConverter
+	retryManager    *RetryManager
+	idGenerator     sqlplugin.IDGenerator   // ID generator for tables without BIGSERIAL support
+	poolMetrics     DSQLMetrics             // Pool metrics collector (only for main DB, not transactions)
+	reservoirHandle *driver.ReservoirHandle // Reservoir handle for lifecycle management (only for main DB) - DEPRECATED, use reservoirHolder
+	reservoirHolder *reservoirHandleHolder  // Holder for reservoir handle that survives reconnects
+	logger          log.Logger              // Logger for assertions and error reporting
 
 	handle *sqlplugin.DatabaseHandle
 	tx     *sqlx.Tx
@@ -129,10 +132,21 @@ func (pdb *db) conn() sqlplugin.Conn {
 // Specifically, SQLSTATE 40001 (serialization/OCC conflict) and 0A000 (unsupported feature)
 // must remain visible to the SqlStore tx retry policy.
 // All other errors are converted using the Temporal sql handle.
+//
+// IMPORTANT: ErrReservoirEmpty is handled specially - it's a transient backpressure signal
+// that should NOT trigger DatabaseHandle.ConvertError (which would recreate the entire pool).
+// Instead, we convert it to a retryable Unavailable error.
 func (pdb *db) maybeConvertError(err error) error {
 	if err == nil {
 		return nil
 	}
+
+	// Handle reservoir empty as transient backpressure - do NOT pass to handle.ConvertError
+	// which would trigger pool recreation and cause cascading reservoir creation.
+	if errors.Is(err, driver.ErrReservoirEmpty) {
+		return serviceerror.NewUnavailable("dsql reservoir empty: transient backpressure, retry")
+	}
+
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.SQLState() {
@@ -172,6 +186,13 @@ func (pdb *db) BeginTx(ctx context.Context) (sqlplugin.Tx, error) {
 
 // Close closes the connection to the dsql db
 func (pdb *db) Close() error {
+	// Stop reservoir refiller if running (prevents goroutine leak)
+	// Use the holder if available (preferred), otherwise fall back to direct handle
+	if pdb.reservoirHolder != nil {
+		pdb.reservoirHolder.Stop()
+	} else if pdb.reservoirHandle != nil {
+		pdb.reservoirHandle.Stop()
+	}
 	// Stop pool metrics collector if running
 	if pdb.poolMetrics != nil {
 		pdb.poolMetrics.StopPoolCollector()
