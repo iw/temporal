@@ -29,6 +29,17 @@ DSQL has a **cluster-wide connection rate limit of 100 connections/second**. Whe
 - Global rate limit (100/sec) constrains all services
 - Pool shrinks during burst expiry, causing latency spikes
 
+## Ephemeral Pool Design
+
+The reservoir treats Go's `database/sql` connection pool as **ephemeral** — the pool itself does not own connection lifecycle. Instead:
+
+- **The reservoir owns all connections.** It creates them, tracks their age, and discards them when they approach expiry.
+- **`database/sql` is a pass-through.** When the pool calls `driver.Open()`, it receives a pre-created connection from the reservoir channel. When the pool closes a connection, the reservoir reclaims the lease.
+- **`MaxConnLifetime` is disabled** (set to 0) because the reservoir manages lifetime via `BASE_LIFETIME` + jitter. Letting `database/sql` also expire connections would cause double-eviction and unnecessary churn.
+- **`MaxConnIdleTime` is disabled** (set to 0) to prevent the pool from shrinking during low-traffic periods. The reservoir keeps connections warm regardless of query activity.
+
+This means the pool size stays constant at `maxOpen` and never decays. Connection replacement happens one-at-a-time in the background refiller, paced by the rate limiter — never in the request path.
+
 ## Solution: Connection Reservoir
 
 A **reservoir** is a buffer of pre-created connections that sits between the rate-limited connection creation and the pool's bursty demand.
@@ -686,9 +697,6 @@ export DSQL_TOKEN_BUCKET_CAPACITY=1000
 export DSQL_DISTRIBUTED_CONN_LEASE_ENABLED=true
 export DSQL_DISTRIBUTED_CONN_LEASE_TABLE=temporal-dsql-conn-lease
 ```
-export DSQL_DISTRIBUTED_CONN_LEASE_TABLE=temporal-dsql-conn-lease
-export DSQL_DISTRIBUTED_CONN_LIMIT=10000
-```
 
 ### ECS Task Definition Example
 
@@ -765,7 +773,7 @@ database/sql          reservoirDriver          Reservoir
      │  (persistence layer retries)                │
 ```
 
-**Note:** `Open()` is strictly non-blocking. When the reservoir is empty, it immediately returns `ErrReservoirEmpty` (not `driver.ErrBadConn`). This is critical to prevent pool recreation cascades.
+**Note:** `Open()` is strictly non-blocking. When the reservoir is empty, it returns `ErrReservoirEmpty` — a custom sentinel error that signals transient backpressure. This is intentionally *not* `driver.ErrBadConn`, which would tell `database/sql` the connection is corrupted and trigger pool recreation. See [Why ErrReservoirEmpty](#why-errreservoirempty-not-drivererrbadconn) for the full rationale.
 
 ### Refiller Loop
 
@@ -796,19 +804,30 @@ Refiller              RateLimiter         LeaseManager         Reservoir
 
 ### Why ErrReservoirEmpty (not driver.ErrBadConn)?
 
-When the reservoir is empty, we return `ErrReservoirEmpty` instead of `driver.ErrBadConn`. This is a critical design decision:
+When the reservoir is empty, we return `ErrReservoirEmpty` instead of `driver.ErrBadConn`. This is a critical design decision that prevents cascading pool recreation:
 
-- **`driver.ErrBadConn`** signals a corrupted connection and triggers `DatabaseHandle.ConvertError` to recreate the entire connection pool. This would create a new reservoir and leak the old refiller goroutines, causing a cascade of pool recreations.
+**What `driver.ErrBadConn` does:**
+1. `database/sql` interprets it as "this connection is corrupted"
+2. It calls `DatabaseHandle.ConvertError`, which can trigger pool recreation
+3. Pool recreation creates a *new* `database/sql` pool and a *new* reservoir
+4. The old refiller goroutines are leaked — they keep running, consuming rate limit budget
+5. The new reservoir starts filling from scratch, competing with the leaked refiller
+6. Under sustained load, this cascades: each empty event creates another pool, each pool leaks another refiller
 
-- **`ErrReservoirEmpty`** signals transient backpressure. The persistence layer treats this as a retryable error without triggering pool recreation.
+**What `ErrReservoirEmpty` does:**
+1. The persistence layer sees a retryable error (not a corrupted connection)
+2. It backs off and retries, giving the refiller time to replenish
+3. No pool recreation, no goroutine leaks, no cascade
+4. The reservoir self-heals as the refiller catches up
 
 ```go
 // ErrReservoirEmpty is returned when the reservoir has no connections available.
 // This is a transient backpressure signal, NOT a corrupted connection error.
+// Returning driver.ErrBadConn here would trigger pool recreation cascades.
 var ErrReservoirEmpty = errors.New("dsql reservoir empty: no connections available")
 ```
 
-The persistence layer's retry logic handles `ErrReservoirEmpty` by backing off and retrying, giving the refiller time to replenish the reservoir.
+The persistence layer's retry logic handles `ErrReservoirEmpty` by backing off and retrying, giving the refiller time to replenish the reservoir. Under normal operation, empty events should be rare — the refiller keeps the reservoir full, and the brief 100ms blocking wait in `Open()` smooths out transient gaps.
 
 ## Metrics
 
@@ -842,38 +861,6 @@ The persistence layer's retry logic handles `ErrReservoirEmpty` by backing off a
 | `dsql_reservoir_size / dsql_reservoir_target` | > 0.9 | < 0.5 for 5 min |
 | `rate(dsql_reservoir_empty_total[5m])` | 0 | > 0 for 2 min |
 | `rate(dsql_reservoir_refill_failures_total[5m])` | 0 | > 0 for 5 min |
-
-## Implementation Status
-
-### Completed
-
-- [x] `reservoir.go` - Channel-based reservoir with guard window and ScanAndEvict
-- [x] `reservoir_driver.go` - Driver implementation with brief blocking wait
-- [x] `reservoir_conn.go` - Connection wrapper with bad connection tracking
-- [x] `reservoir_refiller.go` - Continuous refiller with proactive expiry scanner
-- [x] `distributed_conn_lease.go` - DynamoDB lease manager
-- [x] `reservoir_config.go` - Configuration from environment
-- [x] `conn_lease_config.go` - Lease configuration
-- [x] Unit tests for all components
-- [x] Initial fill synchronization
-- [x] Connection age tracking (CreatedAt + Lifetime)
-- [x] Proactive expiry scanning (every 1 second)
-- [x] Eviction callback (lease release on discard)
-- [x] Grafana dashboard panels
-- [x] Metrics: checkout latency, refills, discards by reason
-
-### Validated
-
-- [x] Sub-millisecond checkout latency (p99 < 1ms)
-- [x] Zero empty reservoir events under load
-- [x] Continuous refill during expiry cycles
-- [x] Proactive eviction of expiring connections
-
-### Pending
-
-- [ ] Integration tests with actual DSQL cluster at scale
-- [ ] Setup script for DynamoDB table
-- [ ] ECS task definition updates
 
 ## When to Use Reservoir Mode
 
@@ -1012,11 +999,11 @@ Before diving into specific issues, run through this checklist:
 | `expired_on_return` | Long-running transactions | Increase base lifetime |
 | `reservoir_full` | Low checkout rate | Reduce target size to match actual demand |
 
-#### Issue: Empty Reservoir Events (ErrBadConn)
+#### Issue: Empty Reservoir Events
 
 **Symptoms:**
 - `dsql_reservoir_empty_total` counter increasing
-- Application logs showing connection retry messages
+- Application logs showing `ErrReservoirEmpty` or connection retry messages
 - Intermittent latency spikes
 
 **Diagnostic Steps:**
