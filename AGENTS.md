@@ -97,12 +97,11 @@
 - Connection pool metrics (open, idle, in-use)
 
 #### Documentation
-- `docs/dsql/overview.md` - High-level overview
+- `docs/dsql/README.md` - Documentation index
+- `docs/dsql/deployment.md` - Production deployment and configuration
 - `docs/dsql/implementation.md` - Technical implementation details
 - `docs/dsql/reservoir-design.md` - Reservoir architecture and configuration
-- `docs/dsql/reservoir-empty-fix.md` - Fix for cascading pool recreation bug
 - `docs/dsql/metrics.md` - Metrics reference
-- `docs/dsql/migration-guide.md` - Migration instructions
 
 #### Tooling
 - `tools/poolsim/` - Discrete event simulator for reservoir behavior validation
@@ -161,10 +160,9 @@ export DSQL_SLOT_BLOCK_RENEW_INTERVAL=1m
 
 | Document | Description |
 |----------|-------------|
-| `docs/dsql/overview.md` | High-level overview of DSQL support |
+| `docs/dsql/README.md` | Documentation index |
+| `docs/dsql/deployment.md` | Production deployment and configuration |
 | `docs/dsql/implementation.md` | Technical implementation details |
 | `docs/dsql/reservoir-design.md` | Reservoir architecture and configuration |
-| `docs/dsql/reservoir-empty-fix.md` | Fix for cascading pool recreation bug |
 | `docs/dsql/metrics.md` | Metrics reference |
-| `docs/dsql/migration-guide.md` | Migration from PostgreSQL to DSQL |
 | `tools/poolsim/README.md` | Pool simulator documentation |
