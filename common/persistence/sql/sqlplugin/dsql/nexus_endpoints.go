@@ -3,10 +3,48 @@ package dsql
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
+	"strings"
 
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
 )
+
+// dsqlNexusEndpointRow is a DSQL-specific scan target for nexus_endpoints.
+// DSQL returns UUID columns as strings, but sqlplugin.NexusEndpointsRow.ID
+// is []byte. We scan into this struct and convert back.
+type dsqlNexusEndpointRow struct {
+	ID           string `db:"id"`
+	Data         []byte `db:"data"`
+	DataEncoding string `db:"data_encoding"`
+	Version      int64  `db:"version"`
+}
+
+// toPluginRow converts a DSQL-scanned row to the sqlplugin row type.
+// The UUID string (e.g. "6365cfab-74bf-4e32-89d1-c2f9e4993763") is
+// parsed back to 16 raw bytes.
+func (r *dsqlNexusEndpointRow) toPluginRow() sqlplugin.NexusEndpointsRow {
+	return sqlplugin.NexusEndpointsRow{
+		ID:           uuidStringToBytes(r.ID),
+		Data:         r.Data,
+		DataEncoding: r.DataEncoding,
+		Version:      r.Version,
+	}
+}
+
+// uuidStringToBytes parses a UUID string like "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+// into 16 raw bytes. Returns nil for empty strings.
+func uuidStringToBytes(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	s = strings.ReplaceAll(s, "-", "")
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return []byte(s) // fallback: return raw string bytes
+	}
+	return b
+}
 
 const (
 	createEndpointsTableVersionQry    = `INSERT INTO nexus_endpoints_partition_status(version) VALUES(1)`
@@ -85,21 +123,37 @@ func (pdb *db) GetNexusEndpointByID(
 	ctx context.Context,
 	id []byte,
 ) (*sqlplugin.NexusEndpointsRow, error) {
-	var row sqlplugin.NexusEndpointsRow
+	var dsqlRow dsqlNexusEndpointRow
 	// Convert UUID bytes to string for DSQL UUID column compatibility
 	idStr := BytesToUUIDString(id)
-	err := pdb.GetContext(ctx, &row, getEndpointByIdQry, idStr)
-	return &row, err
+	err := pdb.GetContext(ctx, &dsqlRow, getEndpointByIdQry, idStr)
+	if err != nil {
+		return nil, err
+	}
+	row := dsqlRow.toPluginRow()
+	return &row, nil
 }
 
 func (pdb *db) ListNexusEndpoints(
 	ctx context.Context,
 	request *sqlplugin.ListNexusEndpointsRequest,
 ) ([]sqlplugin.NexusEndpointsRow, error) {
-	var rows []sqlplugin.NexusEndpointsRow
-	// Convert UUID bytes to string for DSQL UUID column compatibility
-	// Handle empty LastID (first call)
+	var dsqlRows []dsqlNexusEndpointRow
+	// Convert UUID bytes to string for DSQL UUID column compatibility.
+	// When LastID is empty (first page), use the nil UUID as the minimum bound
+	// so that "WHERE id > $1" returns all rows. DSQL's UUID type rejects empty
+	// strings, unlike PostgreSQL's BYTEA which accepts empty byte slices.
 	lastIDStr := BytesToUUIDString(request.LastID)
-	err := pdb.SelectContext(ctx, &rows, getEndpointsQry, lastIDStr, request.Limit)
+	if lastIDStr == "" {
+		lastIDStr = NilUUID
+	}
+	err := pdb.SelectContext(ctx, &dsqlRows, getEndpointsQry, lastIDStr, request.Limit)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]sqlplugin.NexusEndpointsRow, len(dsqlRows))
+	for i := range dsqlRows {
+		rows[i] = dsqlRows[i].toPluginRow()
+	}
 	return rows, err
 }
