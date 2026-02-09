@@ -29,9 +29,9 @@ DSQL has a **cluster-wide connection rate limit of 100 connections/second**. Whe
 - Global rate limit (100/sec) constrains all services
 - Pool shrinks during burst expiry, causing latency spikes
 
-## Ephemeral Pool Design
+## Pool Lifecycle Ownership
 
-The reservoir treats Go's `database/sql` connection pool as **ephemeral** — the pool itself does not own connection lifecycle. Instead:
+In reservoir mode, the reservoir owns connection lifecycle — not `database/sql`. The pool is a pass-through:
 
 - **The reservoir owns all connections.** It creates them, tracks their age, and discards them when they approach expiry.
 - **`database/sql` is a pass-through.** When the pool calls `driver.Open()`, it receives a pre-created connection from the reservoir channel. When the pool closes a connection, the reservoir reclaims the lease.
@@ -39,6 +39,22 @@ The reservoir treats Go's `database/sql` connection pool as **ephemeral** — th
 - **`MaxConnIdleTime` is disabled** (set to 0) to prevent the pool from shrinking during low-traffic periods. The reservoir keeps connections warm regardless of query activity.
 
 This means the pool size stays constant at `maxOpen` and never decays. Connection replacement happens one-at-a-time in the background refiller, paced by the rate limiter — never in the request path.
+
+## Ephemeral Pools
+
+Temporal creates short-lived database connections during startup for operations like schema version checks (`VerifyCompatibleVersion`) and metadata initialization. These are not service pools — they open, run a few queries, and close immediately.
+
+The DSQL plugin recognises these via `config.SQL.PoolSizeHint = "ephemeral"` (set in `version_checker.go` and `fx.go`). When the reservoir sees this hint, it uses a minimal configuration:
+
+| Setting | Ephemeral | Service (default) |
+|---------|-----------|-------------------|
+| Target ready | 5 | `maxOpen` (typically 50) |
+| Low watermark | 5 | `maxOpen` |
+| Initial fill timeout | 10s | 30s |
+| Inflight limit | 2 | 8 |
+| Distributed conn leasing | Skipped | Enabled (if configured) |
+
+This avoids wasting rate limit budget and DynamoDB calls on pools that exist for seconds. The ephemeral pool still benefits from the reservoir's IAM token caching and rate limiting — it just uses far fewer resources.
 
 ## Solution: Connection Reservoir
 
@@ -133,8 +149,6 @@ type PhysicalConn struct {
 3. **Guard Window**: Connections within `guardWindow` of expiry are discarded on checkout/return. This prevents handing out connections that will expire mid-transaction.
 
 4. **Non-blocking Operations**: All operations required by `driver.Open()` are non-blocking. Reservoir refilling (which may block on global limiters) happens in the background.
-
-5. **Brief Blocking Wait**: Before returning `ErrBadConn`, the driver waits briefly (100ms) for the refiller to catch up. This smooths out transient empty reservoir conditions.
 
 ## Refiller and Expiry Scanner
 
