@@ -432,24 +432,12 @@ The token bucket limiter logs:
 - **Debug**: Token acquired (only if wait > 10ms or retries > 1)
 - **Warn**: Token acquire failure or timeout
 
-### Per-Second Counter (Legacy)
+### Fallback Rate Limiters
 
-The legacy distributed rate limiter uses a simple per-second counter. It does not support burst capacity.
+When token bucket mode is not enabled, the plugin falls back to simpler rate limiting:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED` | `false` | Enable distributed rate limiting |
-| `DSQL_DISTRIBUTED_RATE_LIMITER_TABLE` | - | DynamoDB table name |
-| `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT` | `100` | Connections per second |
-
-### Local Rate Limiter
-
-When distributed rate limiting is disabled, each service instance uses a local token bucket rate limiter. This requires manual partitioning of the 100/sec budget across instances.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DSQL_CONNECTION_RATE_LIMIT` | `10` | Connections per second per instance |
-| `DSQL_CONNECTION_BURST_LIMIT` | `100` | Burst capacity per instance |
+- **Per-Second Counter** (`DSQL_TOKEN_BUCKET_ENABLED=false`): DynamoDB-backed counter per second. No burst support. Config: `DSQL_DISTRIBUTED_RATE_LIMITER_LIMIT` (default: 100).
+- **Local Rate Limiter** (`DSQL_DISTRIBUTED_RATE_LIMITER_ENABLED=false`): Per-instance `rate.Limiter`. Requires manual partitioning of the 100/sec budget. Config: `DSQL_CONNECTION_RATE_LIMIT` (default: 10/sec), `DSQL_CONNECTION_BURST_LIMIT` (default: 100).
 
 ## In-Flight Semaphore
 
@@ -488,7 +476,7 @@ The reservoir is configured entirely through environment variables, allowing ope
 |----------|---------|------|-------------|
 | `DSQL_RESERVOIR_ENABLED` | `false` | Boolean | Enable reservoir mode. When `false`, the plugin uses the standard token-refreshing driver with pool warmup. |
 | `DSQL_RESERVOIR_TARGET_READY` | `maxOpen` | Integer | Target number of connections to maintain in the reservoir. Defaults to the pool's `maxOpen` setting. |
-| `DSQL_RESERVOIR_LOW_WATERMARK` | `maxOpen` | Integer | Threshold below which the refiller uses aggressive (warmup) pacing. Defaults to `maxOpen`. |
+| `DSQL_RESERVOIR_LOW_WATERMARK` | `maxOpen` | Integer | Threshold below which the refiller is in deficit. Used for initial fill synchronization — the plugin waits for the reservoir to reach this level before accepting traffic. Defaults to `maxOpen`. |
 | `DSQL_RESERVOIR_BASE_LIFETIME` | `11m` | Duration | Base lifetime for connections before they are discarded. Should be less than DSQL's 60-minute connection limit. |
 | `DSQL_RESERVOIR_LIFETIME_JITTER` | `2m` | Duration | Random jitter added to each connection's lifetime to prevent synchronized expiry. Actual lifetime = base ± jitter/2. |
 | `DSQL_RESERVOIR_GUARD_WINDOW` | `45s` | Duration | Time before expiry when connections are considered too old to hand out. Prevents mid-transaction expiry. |
@@ -551,16 +539,16 @@ export DSQL_RESERVOIR_TARGET_READY=50
 
 #### `DSQL_RESERVOIR_LOW_WATERMARK`
 
-When the reservoir size drops below this threshold, the refiller switches to aggressive (warmup) pacing, using the full rate limit budget to recover quickly.
+When the reservoir size drops below this threshold, the reservoir is considered in deficit. The refiller runs back-to-back `openOne()` calls (rate limiter is the only throttle) until the reservoir reaches target.
 
 **Considerations:**
-- Set equal to `TARGET_READY` for maximum responsiveness
-- Set lower (e.g., 50% of target) to reduce rate limit usage during normal operation
-- The refiller smoothly transitions between warmup and steady-state pacing
+- Set equal to `TARGET_READY` for simplicity (recommended)
+- The refiller always fills as fast as the rate limiter allows when below target
+- This value is used for initial fill synchronization — the plugin waits for the reservoir to reach the low watermark before accepting traffic
 
 **Example:**
 ```bash
-export DSQL_RESERVOIR_LOW_WATERMARK=25  # Aggressive refill below 25 connections
+export DSQL_RESERVOIR_LOW_WATERMARK=50
 ```
 
 #### `DSQL_RESERVOIR_BASE_LIFETIME`
@@ -657,10 +645,9 @@ export DSQL_DISTRIBUTED_CONN_LIMIT=10000
 | Pool Size | Reservoir Target | Low Watermark | Rationale |
 |-----------|------------------|---------------|-----------|
 | 10 | 10 | 10 | Match pool size for small pools |
-| 50 | 50 | 50 | Match pool size, aggressive refill always |
-| 50 | 50 | 25 | Match pool size, aggressive refill below 50% |
+| 50 | 50 | 50 | Match pool size (recommended) |
 | 100 | 100 | 100 | Match pool size |
-| 500 | 500 | 250 | Large pools have natural distribution |
+| 500 | 500 | 500 | Match pool size for large pools |
 
 ### Recommended Configurations
 
@@ -841,7 +828,7 @@ When the reservoir is empty, we return `ErrReservoirEmpty` instead of `driver.Er
 var ErrReservoirEmpty = errors.New("dsql reservoir empty: no connections available")
 ```
 
-The persistence layer's retry logic handles `ErrReservoirEmpty` by backing off and retrying, giving the refiller time to replenish the reservoir. Under normal operation, empty events should be rare — the refiller keeps the reservoir full, and the brief 100ms blocking wait in `Open()` smooths out transient gaps.
+The persistence layer's retry logic handles `ErrReservoirEmpty` by backing off and retrying, giving the refiller time to replenish the reservoir. Under normal operation, empty events should be rare — the refiller keeps the reservoir full.
 
 ## Metrics
 
@@ -1363,7 +1350,7 @@ DSQL_DISTRIBUTED_CONN_LIMIT=10000
 ### FAQ
 
 **Q: How long does initial fill take?**
-A: Depends on rate limit and target size. With 100/sec limit and 50 target, expect ~1 second. With distributed rate limiting across many services, it may take longer.
+A: Depends on rate limit, target size, and in-flight semaphore. With a local rate limiter and 50 target connections, expect ~5 seconds (as seen in startup logs). With distributed rate limiting across many services competing for the 100/sec budget, it may take longer.
 
 **Q: What happens if DynamoDB is unavailable?**
 A: Lease acquire fails, refiller backs off and retries. Existing connections continue to work. New connections cannot be created until DynamoDB recovers.

@@ -49,7 +49,7 @@
 ### ✅ Completed
 
 #### Schema Compatibility
-- DSQL-compatible schema (`schema/dsql/v12/temporal/schema.sql`)
+- DSQL-compatible schema (`schema/dsql/temporal/schema.sql`)
 - BYTEA → UUID conversion for composite primary keys
 - BIGSERIAL → BIGINT with Snowflake ID generation
 - CHECK constraints removed (application-level validation)
@@ -65,31 +65,12 @@
 #### IAM Authentication
 - Token-refreshing driver with automatic credential refresh
 - Token cache with expiry management
-- Connection rate limiting (local and distributed)
 
-#### Connection Management - Reservoir Mode (Recommended)
-- **Connection Reservoir** (`driver/reservoir.go`) - Channel-based buffer of pre-created connections
-- **Continuous Refiller** (`driver/reservoir_refiller.go`) - Background goroutine that fills reservoir
-- **Proactive Expiry Scanner** - Evicts connections before they expire
-- **Guard Window** - Discards connections too close to expiry
-- **In-Flight Semaphore** - Limits concurrent Open() calls to prevent handshake pile-ups (default: 8)
-- **Reservoir Empty Fix** - Returns `ErrReservoirEmpty` instead of `driver.ErrBadConn` to prevent cascading pool recreation
-
-#### Distributed Rate Limiting
-- **Token Bucket Rate Limiter** (recommended) - Uses DSQL's burst capacity (1000) with 100/sec sustained
-- **Per-Second Counter** (legacy) - Simple counter per second, no burst support
-- **Local Rate Limiter** - Per-instance rate limiting (no coordination)
-
-#### Distributed Connection Limiting
-- **Slot Block Manager** - Block-based allocation to avoid hot partition issues
-- Each service acquires blocks of 100 slots (configurable)
-- 100 blocks × 100 slots = 10,000 total slots
-- TTL-based crash recovery (blocks become available after TTL expires)
-- No hot partition: each block has its own DynamoDB partition key
-
-#### Connection Management - Legacy Mode
-- Pool Warmup - Sequential connection creation at startup
-- Pool Keeper - Background maintenance for connection replacement
+#### Connection Management
+- **Connection Reservoir** (recommended) — Channel-based buffer with continuous refiller, proactive expiry scanner, guard window, in-flight semaphore
+- **Token Bucket Rate Limiter** (recommended) — DynamoDB-backed, uses DSQL's burst capacity (1000) with 100/sec sustained
+- **Slot Block Manager** — Block-based distributed connection leasing to avoid DynamoDB hot partitions (100 blocks × 100 slots = 10k)
+- Non-reservoir fallback (pool warmup + pool keeper) retained for environments without DynamoDB
 
 #### Observability
 - DSQL-specific metrics (conflicts, retries, latency)

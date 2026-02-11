@@ -38,7 +38,9 @@ The `error_class` label can have these values:
 | `dsql_pool_wait_total` | Counter | Times a connection was waited for |
 | `dsql_pool_wait_duration` | Timer | Total time spent waiting for connections |
 
-### Pool Keeper Metrics
+### Pool Keeper Metrics (non-reservoir mode only)
+
+These metrics are only emitted when reservoir mode is disabled (`DSQL_RESERVOIR_ENABLED=false`):
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -48,20 +50,22 @@ The `error_class` label can have these values:
 
 ### Connection Closure Metrics
 
-These metrics track WHY connections are being closed, helping diagnose pool decay:
+These metrics track WHY connections are being closed by `database/sql`, helping diagnose pool decay. In reservoir mode, `MaxConnLifetime` and `MaxConnIdleTime` are both set to 0 (the reservoir manages lifecycle), so these counters should remain at 0.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `dsql_db_closed_max_lifetime_total` | Gauge | Connections closed due to `MaxConnLifetime` (expected after 55 min) |
+| `dsql_db_closed_max_lifetime_total` | Gauge | Connections closed due to `MaxConnLifetime` (expected — normal rotation) |
 | `dsql_db_closed_max_idle_time_total` | Gauge | Connections closed due to `MaxConnIdleTime` (should be 0 if configured correctly) |
 | `dsql_db_closed_max_idle_total` | Gauge | Connections closed because idle pool was full (shouldn't happen if `MaxIdleConns = MaxConns`) |
 
-**Interpreting closure metrics:**
+**Interpreting closure metrics (non-reservoir mode):**
 
-- **`dsql_db_closed_max_lifetime_total` increasing**: Normal - connections are being rotated after 55 minutes
+- **`dsql_db_closed_max_lifetime_total` increasing**: Normal — connections are being rotated after `MaxConnLifetime` (default: 10 min, override via `TEMPORAL_SQL_MAX_CONN_LIFETIME`)
 - **`dsql_db_closed_max_idle_time_total` increasing**: Problem - `MaxConnIdleTime` should be 0 to prevent pool decay
 - **`dsql_db_closed_max_idle_total` increasing**: Problem - `MaxIdleConns` should equal `MaxConns`
 - **Pool shrinking but closure counters flat**: Server/network is closing connections (check DSQL logs, network issues)
+
+In reservoir mode, all three counters should be 0. If they're increasing, something is overriding the reservoir's pool settings.
 
 Pool metrics are sampled every 15 seconds by a background collector.
 
@@ -312,7 +316,7 @@ dsql_pool_max_open
 rate(dsql_pool_wait_total[5m])
 
 # Connection closures by reason (helps diagnose pool decay)
-dsql_db_closed_max_lifetime_total   # Expected: increases every 55 min
+dsql_db_closed_max_lifetime_total   # Expected: increases every MaxConnLifetime interval
 dsql_db_closed_max_idle_time_total  # Should be 0 if MaxConnIdleTime=0
 dsql_db_closed_max_idle_total       # Should be 0 if MaxIdleConns=MaxConns
 ```
@@ -330,21 +334,6 @@ sum by (attempt) (rate(dsql_tx_retry_total[5m]))
 # Backoff time spent
 rate(dsql_tx_backoff_sum[5m])
 ```
-
-## Legacy Metrics
-
-These metrics are maintained for backward compatibility:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `dsql_tx_retries_total` | Counter | Retry attempts (legacy) |
-| `dsql_tx_conflicts_total` | Counter | Conflicts (legacy) |
-| `dsql_condition_failed_total` | Counter | CAS failures |
-| `dsql_operation_duration` | Timer | Operation duration |
-| `dsql_retry_attempts` | Histogram | Retry attempt distribution |
-| `dsql_active_transactions` | Gauge | Active transaction count |
-| `dsql_errors_total` | Counter | Errors by type |
-| `dsql_unsupported_feature_total` | Counter | Unsupported feature usage |
 
 ## Metric Collection
 
