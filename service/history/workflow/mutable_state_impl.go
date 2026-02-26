@@ -62,7 +62,6 @@ import (
 	"go.temporal.io/server/common/util"
 	"go.temporal.io/server/common/worker_versioning"
 	"go.temporal.io/server/components/callbacks"
-	"go.temporal.io/server/components/nexusoperations"
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/consts"
 	"go.temporal.io/server/service/history/events"
@@ -416,6 +415,7 @@ func NewMutableState(
 			s,
 			chasm.DefaultPathEncoder,
 			logger,
+			shard.GetMetricsHandler(),
 		)
 	}
 
@@ -563,6 +563,7 @@ func NewMutableStateFromDB(
 			mutableState,
 			chasm.DefaultPathEncoder,
 			mutableState.logger, // this logger is tagged with execution key.
+			shard.GetMetricsHandler(),
 		)
 		if err != nil {
 			return nil, err
@@ -757,7 +758,7 @@ func (ms *MutableStateImpl) GetNexusCompletion(
 			},
 		}
 	}
-	startLink := nexusoperations.ConvertLinkWorkflowEventToNexusLink(link)
+	startLink := commonnexus.ConvertLinkWorkflowEventToNexusLink(link)
 
 	switch ce.GetEventType() {
 	case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED:
@@ -8738,12 +8739,12 @@ func (ms *MutableStateImpl) syncExecutionInfo(current *persistencespb.WorkflowEx
 		}
 	}
 
-	doNotSync := func(v any) []interface{} {
+	doNotSync := func(v any) []any {
 		info, ok := v.(*persistencespb.WorkflowExecutionInfo)
 		if !ok || info == nil {
 			return nil
 		}
-		ignoreFields := []interface{}{
+		ignoreFields := []any{
 			&info.WorkflowTaskVersion,
 			&info.WorkflowTaskScheduledEventId,
 			&info.WorkflowTaskStartedEventId,

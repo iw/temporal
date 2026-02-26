@@ -164,7 +164,7 @@ func (m *SqlStore) txExecute(ctx context.Context, operation string, f func(tx sq
 	return lastErr
 }
 
-func gobSerialize(x interface{}) ([]byte, error) {
+func gobSerialize(x any) ([]byte, error) {
 	b := bytes.Buffer{}
 	e := gob.NewEncoder(&b)
 	err := e.Encode(x)
@@ -174,7 +174,7 @@ func gobSerialize(x interface{}) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-func gobDeserialize(a []byte, x interface{}) error {
+func gobDeserialize(a []byte, x any) error {
 	b := bytes.NewBuffer(a)
 	d := gob.NewDecoder(b)
 	err := d.Decode(x)
