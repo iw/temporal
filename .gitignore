@@ -25,6 +25,7 @@
 /tctl*
 /tdbg
 /poolsim
+/fairsim
 
 # proto images
 /proto/image.bin
@@ -45,6 +46,7 @@
 
 **/.venv/
 **/.ruff_cache/
+
 # Build artifacts
 Dockerfile.temporal-dsql
 
@@ -53,3 +55,6 @@ terraform.tfstate
 terraform.tfstate.backup
 *.tfstate
 *.tfstate.*
+
+# Ignoring AI agent files
+.agents/
