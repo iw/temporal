@@ -57,10 +57,9 @@ func ValidateAndNormalizeEmbeddedActivity(
 	options *activitypb.ActivityOptions,
 	priority *commonpb.Priority,
 	runTimeout *durationpb.Duration,
+	workflowTaskQueueName string,
 ) error {
-	// We cannot use NormalizeAndValidateUserDefined for embedded activity task queue because embedded activities can
-	// use reserved task queues, which are not considered user defined.
-	if err := tqid.NormalizeAndValidate(options.TaskQueue, "", maxIDLengthLimit); err != nil {
+	if err := tqid.NormalizeAndValidateUserDefined(options.TaskQueue, "", workflowTaskQueueName, maxIDLengthLimit); err != nil {
 		return err
 	}
 
@@ -360,6 +359,29 @@ func validateRequestCancelActivityExecutionRequest(
 		req.GetNamespace())
 	if err != nil {
 		return serviceerror.NewInvalidArgument("reason exceeds length limit")
+	}
+
+	return nil
+}
+
+func validateDeleteActivityExecutionRequest(
+	req *workflowservice.DeleteActivityExecutionRequest,
+	maxIDLengthLimit int,
+) error {
+	if req.GetActivityId() == "" {
+		return serviceerror.NewInvalidArgument("activity ID is required")
+	}
+
+	if len(req.GetActivityId()) > maxIDLengthLimit {
+		return serviceerror.NewInvalidArgumentf("activity ID exceeds length limit. Length=%d Limit=%d",
+			len(req.GetActivityId()), maxIDLengthLimit)
+	}
+
+	if runID := req.GetRunId(); runID != "" {
+		_, err := uuid.Parse(runID)
+		if err != nil {
+			return serviceerror.NewInvalidArgument("invalid run id: must be a valid UUID")
+		}
 	}
 
 	return nil
