@@ -71,7 +71,8 @@ func TestValidateSuccess(t *testing.T) {
 			defaultNamespaceID,
 			&defaultActivityOptions,
 			&defaultPriority,
-			durationpb.New(0))
+			durationpb.New(0),
+			defaultTaskQueue)
 		require.NoError(t, err)
 	})
 }
@@ -326,8 +327,31 @@ func TestEmbeddedActivityTaskQueueValidations(t *testing.T) {
 			defaultNamespaceID,
 			options,
 			&defaultPriority,
-			durationpb.New(0))
+			durationpb.New(0),
+			primitives.PerNSWorkerTaskQueue)
 		require.NoError(t, err)
+	})
+
+	t.Run("Disallow PerNSWorkerTaskQueue TaskQueue", func(t *testing.T) {
+		options := &activitypb.ActivityOptions{
+			TaskQueue:              &taskqueuepb.TaskQueue{Name: primitives.PerNSWorkerTaskQueue},
+			ScheduleToCloseTimeout: durationpb.New(10 * time.Second),
+		}
+
+		err := ValidateAndNormalizeEmbeddedActivity(
+			defaultActivityID,
+			defaultActivityType,
+			getDefaultRetrySettings,
+			defaultMaxIDLengthLimit,
+			defaultNamespaceID,
+			options,
+			&defaultPriority,
+			durationpb.New(0),
+			defaultTaskQueue)
+
+		var invalidArgErr *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArgErr)
+		require.Contains(t, invalidArgErr.Error(), "cannot use internal per-namespace task queue")
 	})
 
 	t.Run("Disallow Internal TaskQueue Prefix", func(t *testing.T) {
@@ -344,7 +368,8 @@ func TestEmbeddedActivityTaskQueueValidations(t *testing.T) {
 			defaultNamespaceID,
 			options,
 			&defaultPriority,
-			durationpb.New(0))
+			durationpb.New(0),
+			defaultTaskQueue)
 
 		var invalidArgErr *serviceerror.InvalidArgument
 		require.ErrorAs(t, err, &invalidArgErr)
@@ -365,7 +390,8 @@ func TestEmbeddedActivityTaskQueueValidations(t *testing.T) {
 			defaultNamespaceID,
 			options,
 			&defaultPriority,
-			durationpb.New(0))
+			durationpb.New(0),
+			defaultTaskQueue)
 
 		var invalidArgErr *serviceerror.InvalidArgument
 		require.ErrorAs(t, err, &invalidArgErr)
@@ -613,6 +639,53 @@ func TestModifiedActivityTimeouts(t *testing.T) {
 			tc.validate(t, tc.options)
 		})
 	}
+}
+
+func TestValidateDeleteActivityExecutionRequest(t *testing.T) {
+	t.Run("Success", func(t *testing.T) {
+		req := &workflowservice.DeleteActivityExecutionRequest{
+			ActivityId: defaultActivityID,
+		}
+		err := validateDeleteActivityExecutionRequest(req, defaultMaxIDLengthLimit)
+		require.NoError(t, err)
+	})
+
+	t.Run("SuccessWithRunID", func(t *testing.T) {
+		req := &workflowservice.DeleteActivityExecutionRequest{
+			ActivityId: defaultActivityID,
+			RunId:      "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+		}
+		err := validateDeleteActivityExecutionRequest(req, defaultMaxIDLengthLimit)
+		require.NoError(t, err)
+	})
+
+	t.Run("EmptyActivityID", func(t *testing.T) {
+		req := &workflowservice.DeleteActivityExecutionRequest{
+			ActivityId: "",
+		}
+		err := validateDeleteActivityExecutionRequest(req, defaultMaxIDLengthLimit)
+		var invalidArgErr *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArgErr)
+	})
+
+	t.Run("ActivityIDTooLong", func(t *testing.T) {
+		req := &workflowservice.DeleteActivityExecutionRequest{
+			ActivityId: string(make([]byte, defaultMaxIDLengthLimit+1)),
+		}
+		err := validateDeleteActivityExecutionRequest(req, defaultMaxIDLengthLimit)
+		var invalidArgErr *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArgErr)
+	})
+
+	t.Run("InvalidRunID", func(t *testing.T) {
+		req := &workflowservice.DeleteActivityExecutionRequest{
+			ActivityId: defaultActivityID,
+			RunId:      "not-a-valid-uuid",
+		}
+		err := validateDeleteActivityExecutionRequest(req, defaultMaxIDLengthLimit)
+		var invalidArgErr *serviceerror.InvalidArgument
+		require.ErrorAs(t, err, &invalidArgErr)
+	})
 }
 
 func getDefaultRetrySettings(_ string) retrypolicy.DefaultRetrySettings {

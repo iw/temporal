@@ -44,6 +44,7 @@ import (
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/enums"
 	"go.temporal.io/server/common/failure"
+	"go.temporal.io/server/common/headers"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
@@ -55,7 +56,6 @@ import (
 	"go.temporal.io/server/common/persistence/transitionhistory"
 	"go.temporal.io/server/common/persistence/versionhistory"
 	"go.temporal.io/server/common/primitives/timestamp"
-	"go.temporal.io/server/common/searchattribute"
 	"go.temporal.io/server/common/searchattribute/sadefs"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
 	"go.temporal.io/server/common/softassert"
@@ -413,7 +413,7 @@ func NewMutableState(
 			s,
 			chasm.DefaultPathEncoder,
 			logger,
-			shard.GetMetricsHandler(),
+			shard.GetMetricsHandler().WithTags(metrics.NamespaceTag(namespaceName)),
 		)
 	}
 
@@ -561,7 +561,7 @@ func NewMutableStateFromDB(
 			mutableState,
 			chasm.DefaultPathEncoder,
 			mutableState.logger, // this logger is tagged with execution key.
-			shard.GetMetricsHandler(),
+			shard.GetMetricsHandler().WithTags(metrics.NamespaceTag(namespaceEntry.Name().String())),
 		)
 		if err != nil {
 			return nil, err
@@ -3320,7 +3320,7 @@ func (ms *MutableStateImpl) updateBinaryChecksumSearchAttribute() error {
 			recentBinaryChecksums = append(recentBinaryChecksums, rp.BinaryChecksum)
 		}
 	}
-	checksumsPayload, err := searchattribute.EncodeValue(recentBinaryChecksums, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
+	checksumsPayload, err := sadefs.EncodeValue(recentBinaryChecksums, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
 	if err != nil {
 		return err
 	}
@@ -3516,7 +3516,7 @@ func (ms *MutableStateImpl) loadBuildIds() ([]string, error) {
 	if !found {
 		return []string{}, nil
 	}
-	decoded, err := searchattribute.DecodeValue(saPayload, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, true)
+	decoded, err := sadefs.DecodeValue(saPayload, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, true)
 	if err != nil {
 		return nil, err
 	}
@@ -3539,7 +3539,7 @@ func (ms *MutableStateImpl) loadSearchAttributeString(saName string) (string, er
 	if !found {
 		return "", nil
 	}
-	decoded, err := searchattribute.DecodeValue(saPayload, enumspb.INDEXED_VALUE_TYPE_KEYWORD, false)
+	decoded, err := sadefs.DecodeValue(saPayload, enumspb.INDEXED_VALUE_TYPE_KEYWORD, false)
 	if err != nil {
 		return "", err
 	}
@@ -3562,7 +3562,7 @@ func (ms *MutableStateImpl) loadUsedDeploymentVersions() ([]string, error) {
 	if !found {
 		return []string{}, nil
 	}
-	decoded, err := searchattribute.DecodeValue(saPayload, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, true)
+	decoded, err := sadefs.DecodeValue(saPayload, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, true)
 	if err != nil {
 		return nil, err
 	}
@@ -3665,7 +3665,7 @@ func (ms *MutableStateImpl) saveBuildIds(buildIds []string, maxSearchAttributeVa
 		hasUnversionedOrAssigned = worker_versioning.IsUnversionedOrAssignedBuildIdSearchAttribute(buildIds[0])
 	}
 	for {
-		saPayload, err := searchattribute.EncodeValue(buildIds, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
+		saPayload, err := sadefs.EncodeValue(buildIds, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
 		if err != nil {
 			return err
 		}
@@ -3693,7 +3693,7 @@ func (ms *MutableStateImpl) saveUsedDeploymentVersions(usedDeploymentVersions []
 	}
 
 	for {
-		saPayload, err := searchattribute.EncodeValue(usedDeploymentVersions, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
+		saPayload, err := sadefs.EncodeValue(usedDeploymentVersions, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
 		if err != nil {
 			return err
 		}
@@ -3721,7 +3721,7 @@ func (ms *MutableStateImpl) saveDeploymentSearchAttributes(deployment, version, 
 	if deployment == "" {
 		saPayloads[sadefs.TemporalWorkerDeployment] = nil
 	} else {
-		deploymentPayload, err := searchattribute.EncodeValue(deployment, enumspb.INDEXED_VALUE_TYPE_KEYWORD)
+		deploymentPayload, err := sadefs.EncodeValue(deployment, enumspb.INDEXED_VALUE_TYPE_KEYWORD)
 		if err != nil {
 			return err
 		}
@@ -3733,7 +3733,7 @@ func (ms *MutableStateImpl) saveDeploymentSearchAttributes(deployment, version, 
 		saPayloads[sadefs.TemporalWorkerDeploymentVersion] = nil
 	} else {
 		saPayloads[sadefs.TemporalWorkerDeploymentVersion] = nil
-		versionPayload, err := searchattribute.EncodeValue(version, enumspb.INDEXED_VALUE_TYPE_KEYWORD)
+		versionPayload, err := sadefs.EncodeValue(version, enumspb.INDEXED_VALUE_TYPE_KEYWORD)
 		if err != nil {
 			return err
 		}
@@ -3744,7 +3744,7 @@ func (ms *MutableStateImpl) saveDeploymentSearchAttributes(deployment, version, 
 	if behavior == "" {
 		saPayloads[sadefs.TemporalWorkflowVersioningBehavior] = nil
 	} else {
-		behaviorPayload, err := searchattribute.EncodeValue(behavior, enumspb.INDEXED_VALUE_TYPE_KEYWORD)
+		behaviorPayload, err := sadefs.EncodeValue(behavior, enumspb.INDEXED_VALUE_TYPE_KEYWORD)
 		if err != nil {
 			return err
 		}
@@ -6449,7 +6449,7 @@ func (ms *MutableStateImpl) buildTemporalPauseInfoEntries() []string {
 func (ms *MutableStateImpl) updatePauseInfoSearchAttribute() error {
 	allEntries := ms.buildTemporalPauseInfoEntries()
 
-	pauseInfoPayload, err := searchattribute.EncodeValue(allEntries, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
+	pauseInfoPayload, err := sadefs.EncodeValue(allEntries, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
 	if err != nil {
 		return err
 	}
@@ -6482,7 +6482,7 @@ func (ms *MutableStateImpl) UpdateReportedProblemsSearchAttribute() error {
 		}
 	}
 
-	reportedProblemsPayload, err := searchattribute.EncodeValue(reportedProblems, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
+	reportedProblemsPayload, err := sadefs.EncodeValue(reportedProblems, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
 	if err != nil {
 		return err
 	}
@@ -6492,7 +6492,7 @@ func (ms *MutableStateImpl) UpdateReportedProblemsSearchAttribute() error {
 		exeInfo.SearchAttributes = make(map[string]*commonpb.Payload, 1)
 	}
 
-	decodedA, err := searchattribute.DecodeValue(exeInfo.SearchAttributes[sadefs.TemporalReportedProblems], enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, false)
+	decodedA, err := sadefs.DecodeValue(exeInfo.SearchAttributes[sadefs.TemporalReportedProblems], enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, false)
 	if err != nil {
 		return err
 	}
@@ -6558,7 +6558,7 @@ func (ms *MutableStateImpl) decodeReportedProblems(p *commonpb.Payload) []string
 		return nil
 	}
 
-	decoded, err := searchattribute.DecodeValue(p, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, false)
+	decoded, err := sadefs.DecodeValue(p, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, false)
 	if err != nil {
 		ms.logger.Error("Failed to decode TemporalReportedProblems payload for logging",
 			tag.Error(err))
@@ -7092,6 +7092,27 @@ func (ms *MutableStateImpl) closeTransaction(
 	workflowEventsSeq, eventBatches, bufferEvents, clearBuffer, err := ms.closeTransactionPrepareEvents(transactionPolicy)
 	if err != nil {
 		return closeTransactionResult{}, err
+	}
+
+	// Stamp events with the caller's principal. Only do this on the active
+	// cluster — standby (passive) replays events that were already stamped by
+	// the active side, and we must not overwrite those principals.
+	if transactionPolicy == historyi.TransactionPolicyActive {
+		principal := headers.GetPrincipal(ctx)
+		for _, we := range workflowEventsSeq {
+			for _, event := range we.Events {
+				// Skip events that already have a principal. Those are previously
+				// buffered events (e.g., signals) that were stamped when originally
+				// created and are now being flushed into history by a different caller
+				// (e.g., the worker completing a workflow task).
+				if event.Principal == nil {
+					event.Principal = principal
+				}
+			}
+		}
+		for _, event := range bufferEvents {
+			event.Principal = principal
+		}
 	}
 
 	// CloseTransaction() on chasmTree may update execution state & status,
